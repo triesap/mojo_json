@@ -3,13 +3,19 @@ repos:
     rev: v3.2.0
     hooks:
     -   id: trailing-whitespace
+        # Mozz writes a binary corpus + crash repros under fuzz/corpus
+        # and .mozz_crashes; never touch those.
+        exclude: ^(fuzz/corpus/|\.mozz_crashes/)
     -   id: end-of-file-fixer
+        exclude: ^(fuzz/corpus/|\.mozz_crashes/)
     -   id: check-yaml
 
 -   repo: local
     hooks:
     -   id: mojo-format
         name: Mojo Format
-        entry: pixi run format
+        # `format` is ambiguous between the dev and fuzz envs (fuzz
+        # layers dev), so name the env explicitly.
+        entry: pixi run -e dev format
         language: system
         pass_filenames: false

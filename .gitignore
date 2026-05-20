@@ -39,3 +39,14 @@ gpu_test.json
 
 # build artifacts
 json-*
+
+# Mozz fuzzing artifacts. The corpus directory is created lazily by
+# each harness (fuzz/corpus/<harness>/seed_NNNN.bin). Treat it as a
+# runtime artifact rather than tracked source -- only fuzz/corpus/
+# itself + a .gitkeep are committed so the dir always exists.
+fuzz/corpus/*
+!fuzz/corpus/.gitkeep
+.mozz_crashes/
+
+# Sanitizer build / log output
+target/sanitize/

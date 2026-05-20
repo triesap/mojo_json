@@ -53,11 +53,23 @@ mojodoc = { git = "https://github.com/ehsanmok/mojodoc.git", branch = "main" }
 [feature.dev.pypi-dependencies]
 gdown = ">=5.0"           # Google Drive CLI for downloading benchmark datasets
 
+# ------------------------------------------------------------------
+# Fuzz feature: mozz harnesses for the FFI boundary, the default Mojo
+# CPU parser, Value access + COW, JSONPath, and NDJSON. Mozz is
+# packaged as mozz.mojopkg into $PREFIX/lib/mojo/ so harnesses pick
+# it up without an explicit -I flag.
+# ------------------------------------------------------------------
+[feature.fuzz.dependencies]
+mozz = { git = "https://github.com/ehsanmok/mozz.git", tag = "v0.1.3" }
+
 [environments]
 # `default` stays lean -- just what's needed to build + run the library.
-# `dev` opts into the extra tooling (docs, linters, dataset downloader).
+# `dev`  opts into the extra tooling (docs, linters, dataset downloader).
+# `fuzz` layers mozz on top of `dev` so fuzz harnesses can also use
+# the dev-only `mojo build` (sysroot pin) and download tooling.
 default = { solve-group = "default" }
 dev     = { features = ["dev"], solve-group = "default" }
+fuzz    = { features = ["dev", "fuzz"], solve-group = "default" }
 
 [tasks]
 # Build simdjson FFI (CPU backend)
@@ -139,3 +151,18 @@ bench-gpu-cujson = { cmd = "bash -c 'F=${1:-benchmark/datasets/twitter.json}; if
 # Docs
 docs = "mojodoc ./json --open"
 docs-build = "mojodoc ./json --out-dir target/doc --base-url /json/"
+
+# ------------------------------------------------------------------
+# Fuzz tasks (mozz). Live under `fuzz` env (`pixi run -e fuzz <task>`).
+# Mozz ships as a mojopkg at $PREFIX/lib/mojo/, so the harnesses don't
+# need a -I path hint. Each harness runs 100k-200k iterations and
+# writes crash repros to .mozz_crashes/<harness>/ -- check those into
+# fuzz/corpus/<harness>/ to lock in regressions.
+# ------------------------------------------------------------------
+[feature.fuzz.tasks]
+fuzz-loads          = "mojo -I . fuzz/fuzz_loads.mojo"
+fuzz-simdjson       = "mojo -I . fuzz/fuzz_simdjson_ffi.mojo"
+fuzz-value-access   = "mojo -I . fuzz/fuzz_value_access.mojo"
+fuzz-jsonpath       = "mojo -I . fuzz/fuzz_jsonpath.mojo"
+fuzz-ndjson         = "mojo -I . fuzz/fuzz_ndjson.mojo"
+fuzz-all            = { depends-on = ["fuzz-loads", "fuzz-simdjson", "fuzz-value-access", "fuzz-jsonpath", "fuzz-ndjson"] }
