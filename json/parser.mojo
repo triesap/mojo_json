@@ -3,7 +3,7 @@
 
 from std.collections import List
 from std.memory import memcpy
-from std.sys import has_apple_gpu_accelerator
+from std.sys import has_apple_gpu_accelerator, is_defined
 
 from .value import Value, Null, make_array_value, make_object_value
 from .serialize import dumps
@@ -13,8 +13,7 @@ from .cpu import SIMDJSON_TYPE_DOUBLE, SIMDJSON_TYPE_STRING
 from .cpu import SIMDJSON_TYPE_ARRAY, SIMDJSON_TYPE_OBJECT
 from .cpu import parse_mojo, parse_simd, parse_cpu_native
 from .types import JSONInput, JSONResult
-from .gpu import parse_json_gpu
-from .iterator import JSONIterator
+from .gpu import parse_json_gpu, parse_gpu_to_value
 
 
 # =============================================================================
@@ -104,7 +103,13 @@ def _parse_cpu[backend: StaticString = "simdjson"](s: String) raises -> Value:
 
 
 def _parse_gpu(s: String) raises -> Value:
-    """Parse JSON using GPU."""
+    """Parse JSON using the GPU pipeline.
+
+    GPU computes structural positions in parallel; the v0.2 tape adapter
+    (`gpu/tape_adapter.mojo`) merges that output with a small CPU
+    quote-only scan and feeds the result to stage 2, so Value
+    construction goes through the same code path as the CPU backends.
+    """
     var data = s.as_bytes()
     var start = 0
 
@@ -122,7 +127,7 @@ def _parse_gpu(s: String) raises -> Value:
 
     var first_char = data[start]
 
-    # Simple primitives - parse directly
+    # Top-level primitives short-circuit GPU launch overhead.
     if first_char == UInt8(ord("n")):
         return Value(Null())
     if first_char == UInt8(ord("t")):
@@ -136,21 +141,17 @@ def _parse_gpu(s: String) raises -> Value:
     ):
         return _parse_number_value(s, start)
 
-    # Objects and arrays - use GPU parser
-    # Create bytes once - used for both GPU parser and iterator
+    # Objects and arrays: GPU produces structural positions, tape adapter
+    # converts them into a Value via stage 2.
     var n = len(data)
     var bytes = List[UInt8](capacity=n)
     bytes.resize(n, 0)
     memcpy(dest=bytes.unsafe_ptr(), src=data.unsafe_ptr(), count=n)
 
-    # GPU parser reads from bytes pointer, doesn't need ownership
-    var input_obj = JSONInput(bytes.copy())  # Copy for GPU parser
+    var input_obj = JSONInput(bytes^)
     var result = parse_json_gpu(input_obj^)
 
-    # Original bytes for iterator
-    var iterator = JSONIterator(result^, bytes^)
-
-    return _build_value(iterator, s)
+    return parse_gpu_to_value(s, result^)
 
 
 def _parse_string_value(s: String, start: Int) raises -> Value:
@@ -215,130 +216,6 @@ def _parse_number_value(s: String, start: Int) raises -> Value:
         return Value(atol(num_str))
 
 
-def _build_value(mut iter: JSONIterator, json: String) raises -> Value:
-    """Build a Value tree from JSONIterator."""
-    var c = iter.get_current_char()
-
-    if c == UInt8(ord("n")):
-        return Value(Null())
-    if c == UInt8(ord("t")):
-        return Value(True)
-    if c == UInt8(ord("f")):
-        return Value(False)
-    if c == 0x22:
-        return Value(iter.get_value())
-    if c == UInt8(ord("-")) or (c >= UInt8(ord("0")) and c <= UInt8(ord("9"))):
-        var s = iter.get_value()
-        var is_float = False
-        var s_bytes = s.as_bytes()
-        for i in range(len(s_bytes)):
-            var ch = s_bytes[i]
-            if (
-                ch == UInt8(ord("."))
-                or ch == UInt8(ord("e"))
-                or ch == UInt8(ord("E"))
-            ):
-                is_float = True
-                break
-        if is_float:
-            return Value(atof(s))
-        return Value(atol(s))
-    if c == 0x5B:
-        return _build_array(iter, json)
-    if c == 0x7B:
-        return _build_object(iter, json)
-
-    var pos = iter.get_position()
-    raise Error(json_parse_error("Unexpected character", json, pos))
-
-
-def _build_array(mut iter: JSONIterator, json: String) raises -> Value:
-    """Build an array Value."""
-    var raw = iter.get_value()
-    var raw_bytes = raw.as_bytes()
-    var count = 0
-    var depth = 0
-    var in_string = False
-    var escaped = False
-
-    for i in range(len(raw_bytes)):
-        var c = raw_bytes[i]
-        if escaped:
-            escaped = False
-            continue
-        if c == UInt8(ord("\\")):
-            escaped = True
-            continue
-        if c == UInt8(ord('"')):
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if c == UInt8(ord("[")) or c == UInt8(ord("{")):
-            depth += 1
-        elif c == UInt8(ord("]")) or c == UInt8(ord("}")):
-            depth -= 1
-        elif c == UInt8(ord(",")) and depth == 1:
-            count += 1
-
-    if raw.byte_length() > 2:
-        count += 1
-
-    return make_array_value(raw, count)
-
-
-def _build_object(mut iter: JSONIterator, json: String) raises -> Value:
-    """Build an object Value."""
-    var raw = iter.get_value()
-    var raw_bytes = raw.as_bytes()
-    var keys = List[String]()
-    var depth = 0
-    var in_string = False
-    var escaped = False
-    var key_start = -1
-    var expect_key = True
-
-    for i in range(len(raw_bytes)):
-        var c = raw_bytes[i]
-        if escaped:
-            escaped = False
-            continue
-        if c == UInt8(ord("\\")):
-            escaped = True
-            continue
-        if c == UInt8(ord('"')):
-            if not in_string:
-                in_string = True
-                if depth == 1 and expect_key:
-                    key_start = i + 1
-            else:
-                in_string = False
-                if key_start >= 0 and depth == 1:
-                    var key_len = i - key_start
-                    var key_bytes = List[UInt8](capacity=key_len)
-                    key_bytes.resize(key_len, 0)
-                    memcpy(
-                        dest=key_bytes.unsafe_ptr(),
-                        src=raw_bytes.unsafe_ptr() + key_start,
-                        count=key_len,
-                    )
-                    keys.append(String(unsafe_from_utf8=key_bytes^))
-                    key_start = -1
-            continue
-        if in_string:
-            continue
-        if c == UInt8(ord("{")) or c == UInt8(ord("[")):
-            depth += 1
-        elif c == UInt8(ord("}")) or c == UInt8(ord("]")):
-            depth -= 1
-        elif c == UInt8(ord(":")) and depth == 1:
-            expect_key = False
-        elif c == UInt8(ord(",")) and depth == 1:
-            expect_key = True
-
-    return make_object_value(raw, keys^)
-
-
 # =============================================================================
 # Public API (Python-compatible)
 # =============================================================================
@@ -368,12 +245,23 @@ def loads[target: StaticString = "cpu"](s: String) raises -> Value:
     elif target == "cpu-simdjson":
         return _parse_cpu["simdjson"](s)
     elif target == "gpu":
-        # On Apple Silicon the Metal compiler backend in this Mojo nightly
-        # does not yet fully support raw-pointer GPU kernels. Fall back to the
-        # native Mojo CPU parser which is already fast (1.4 GB/s) and avoids
-        # H2D/D2H overhead (unified memory). Non-Apple targets use the GPU path.
+        # Apple Silicon's Metal backend in the current Mojo nightly does not
+        # yet fully support raw-pointer GPU kernels. v0.1 silently fell back
+        # to CPU here, which masked perf surprises. v0.2 raises an explicit
+        # error; opt in to the legacy fallback by compiling with
+        # `-D JSON_GPU_ALLOW_APPLE_FALLBACK=1`.
         comptime if has_apple_gpu_accelerator():
-            return _parse_cpu["mojo"](s)
+            comptime if is_defined["JSON_GPU_ALLOW_APPLE_FALLBACK"]():
+                return _parse_cpu["mojo"](s)
+            else:
+                raise Error(
+                    "loads[target='gpu'] is not supported on Apple Silicon in"
+                    " this Mojo nightly (Metal backend lacks raw-pointer"
+                    " kernel support). Use loads(s) (CPU, ~1.4 GB/s) or"
+                    " loads[target='cpu-simdjson'](s) instead. To opt into"
+                    " the legacy silent CPU fallback, recompile with"
+                    " -D JSON_GPU_ALLOW_APPLE_FALLBACK=1."
+                )
         else:
             return _parse_gpu(s)
     else:
