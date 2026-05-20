@@ -35,7 +35,7 @@ Deserialization requires Defaultable and Movable:
 """
 
 from std.builtin.rebind import trait_downcast, downcast
-from std.collections import Optional, List
+from std.collections import Optional, List, Dict
 
 from .value import Value, Null
 from .parser import loads
@@ -63,6 +63,21 @@ comptime _LIST_INT_NAME = reflect[List[Int]]().name()
 comptime _LIST_STRING_NAME = reflect[List[String]]().name()
 comptime _LIST_FLOAT64_NAME = reflect[List[Float64]]().name()
 comptime _LIST_BOOL_NAME = reflect[List[Bool]]().name()
+
+# v0.2 Phase F additions: Dict[String, T], nested Lists, Optional<->List combos.
+comptime _DICT_STRING_INT_NAME = reflect[Dict[String, Int]]().name()
+comptime _DICT_STRING_STRING_NAME = reflect[Dict[String, String]]().name()
+comptime _DICT_STRING_FLOAT64_NAME = reflect[Dict[String, Float64]]().name()
+comptime _DICT_STRING_BOOL_NAME = reflect[Dict[String, Bool]]().name()
+
+comptime _LIST_OPT_INT_NAME = reflect[List[Optional[Int]]]().name()
+comptime _LIST_OPT_STRING_NAME = reflect[List[Optional[String]]]().name()
+
+comptime _OPT_LIST_INT_NAME = reflect[Optional[List[Int]]]().name()
+comptime _OPT_LIST_STRING_NAME = reflect[Optional[List[String]]]().name()
+
+comptime _LIST_LIST_INT_NAME = reflect[List[List[Int]]]().name()
+comptime _LIST_LIST_STRING_NAME = reflect[List[List[String]]]().name()
 
 comptime _Base = ImplicitlyDestructible & Movable
 comptime _JsonStruct = Defaultable & Movable & ImplicitlyDestructible
@@ -288,6 +303,27 @@ def _ser[T: AnyType](value: T) raises -> String:
         return _ser_list_float64(rebind[List[Float64]](value))
     elif tname == _LIST_BOOL_NAME:
         return _ser_list_bool(rebind[List[Bool]](value))
+    # v0.2 Phase F combinator types.
+    elif tname == _DICT_STRING_INT_NAME:
+        return _ser_dict_string_int(rebind[Dict[String, Int]](value))
+    elif tname == _DICT_STRING_STRING_NAME:
+        return _ser_dict_string_string(rebind[Dict[String, String]](value))
+    elif tname == _DICT_STRING_FLOAT64_NAME:
+        return _ser_dict_string_float64(rebind[Dict[String, Float64]](value))
+    elif tname == _DICT_STRING_BOOL_NAME:
+        return _ser_dict_string_bool(rebind[Dict[String, Bool]](value))
+    elif tname == _LIST_OPT_INT_NAME:
+        return _ser_list_opt_int(rebind[List[Optional[Int]]](value))
+    elif tname == _LIST_OPT_STRING_NAME:
+        return _ser_list_opt_string(rebind[List[Optional[String]]](value))
+    elif tname == _OPT_LIST_INT_NAME:
+        return _ser_opt_list_int(rebind[Optional[List[Int]]](value))
+    elif tname == _OPT_LIST_STRING_NAME:
+        return _ser_opt_list_string(rebind[Optional[List[String]]](value))
+    elif tname == _LIST_LIST_INT_NAME:
+        return _ser_list_list_int(rebind[List[List[Int]]](value))
+    elif tname == _LIST_LIST_STRING_NAME:
+        return _ser_list_list_string(rebind[List[List[String]]](value))
     elif reflect[T]().is_struct():
         comptime if conforms_to(T, JsonSerializable):
             ref custom = trait_downcast[JsonSerializable](value)
@@ -417,6 +453,125 @@ def _ser_list_bool(lst: List[Bool]) -> String:
     return out^
 
 
+# --- Dict[String, T] helpers ---
+
+
+def _ser_dict_string_int(d: Dict[String, Int]) -> String:
+    var out = String("{")
+    var first = True
+    for entry in d.items():
+        if not first:
+            out += ","
+        first = False
+        out += _escape_string(entry.key) + ":" + String(entry.value)
+    out += "}"
+    return out^
+
+
+def _ser_dict_string_string(d: Dict[String, String]) -> String:
+    var out = String("{")
+    var first = True
+    for entry in d.items():
+        if not first:
+            out += ","
+        first = False
+        out += _escape_string(entry.key) + ":" + _escape_string(entry.value)
+    out += "}"
+    return out^
+
+
+def _ser_dict_string_float64(d: Dict[String, Float64]) -> String:
+    var out = String("{")
+    var first = True
+    for entry in d.items():
+        if not first:
+            out += ","
+        first = False
+        out += _escape_string(entry.key) + ":" + String(entry.value)
+    out += "}"
+    return out^
+
+
+def _ser_dict_string_bool(d: Dict[String, Bool]) -> String:
+    var out = String("{")
+    var first = True
+    for entry in d.items():
+        if not first:
+            out += ","
+        first = False
+        var v = "true" if entry.value else "false"
+        out += _escape_string(entry.key) + ":" + v
+    out += "}"
+    return out^
+
+
+# --- List[Optional[T]] helpers ---
+
+
+def _ser_list_opt_int(lst: List[Optional[Int]]) -> String:
+    var out = String("[")
+    for i in range(len(lst)):
+        if i > 0:
+            out += ","
+        if lst[i]:
+            out += String(lst[i].value())
+        else:
+            out += "null"
+    out += "]"
+    return out^
+
+
+def _ser_list_opt_string(lst: List[Optional[String]]) -> String:
+    var out = String("[")
+    for i in range(len(lst)):
+        if i > 0:
+            out += ","
+        if lst[i]:
+            out += _escape_string(lst[i].value())
+        else:
+            out += "null"
+    out += "]"
+    return out^
+
+
+# --- Optional[List[T]] helpers ---
+
+
+def _ser_opt_list_int(opt: Optional[List[Int]]) -> String:
+    if opt:
+        return _ser_list_int(opt.value())
+    return "null"
+
+
+def _ser_opt_list_string(opt: Optional[List[String]]) -> String:
+    if opt:
+        return _ser_list_string(opt.value())
+    return "null"
+
+
+# --- List[List[T]] helpers ---
+
+
+def _ser_list_list_int(lst: List[List[Int]]) -> String:
+    var out = String("[")
+    for i in range(len(lst)):
+        if i > 0:
+            out += ","
+        out += _ser_list_int(lst[i])
+    out += "]"
+    return out^
+
+
+def _ser_list_list_string(lst: List[List[String]]) -> String:
+    var out = String("[")
+    for i in range(len(lst)):
+        if i > 0:
+            out += ","
+        out += _ser_list_string(lst[i])
+    out += "]"
+    return out^
+
+
 # ===================================================================
 # Internal -- deserialization helpers
 # ===================================================================
@@ -512,6 +667,57 @@ def _deser_fill[T: AnyType](mut result: T, json: Value) raises:
             ptr.destroy_pointee()
             ptr.bitcast[List[Bool]]().init_pointee_move(
                 _deser_list_bool(json, key)
+            )
+        # ----- v0.2 Phase F combinator types -----
+        elif field_type_name == _DICT_STRING_INT_NAME:
+            ptr.destroy_pointee()
+            ptr.bitcast[Dict[String, Int]]().init_pointee_move(
+                _deser_dict_string_int(json, key)
+            )
+        elif field_type_name == _DICT_STRING_STRING_NAME:
+            ptr.destroy_pointee()
+            ptr.bitcast[Dict[String, String]]().init_pointee_move(
+                _deser_dict_string_string(json, key)
+            )
+        elif field_type_name == _DICT_STRING_FLOAT64_NAME:
+            ptr.destroy_pointee()
+            ptr.bitcast[Dict[String, Float64]]().init_pointee_move(
+                _deser_dict_string_float64(json, key)
+            )
+        elif field_type_name == _DICT_STRING_BOOL_NAME:
+            ptr.destroy_pointee()
+            ptr.bitcast[Dict[String, Bool]]().init_pointee_move(
+                _deser_dict_string_bool(json, key)
+            )
+        elif field_type_name == _LIST_OPT_INT_NAME:
+            ptr.destroy_pointee()
+            ptr.bitcast[List[Optional[Int]]]().init_pointee_move(
+                _deser_list_opt_int(json, key)
+            )
+        elif field_type_name == _LIST_OPT_STRING_NAME:
+            ptr.destroy_pointee()
+            ptr.bitcast[List[Optional[String]]]().init_pointee_move(
+                _deser_list_opt_string(json, key)
+            )
+        elif field_type_name == _OPT_LIST_INT_NAME:
+            ptr.destroy_pointee()
+            ptr.bitcast[Optional[List[Int]]]().init_pointee_move(
+                _deser_opt_list_int(json, key)
+            )
+        elif field_type_name == _OPT_LIST_STRING_NAME:
+            ptr.destroy_pointee()
+            ptr.bitcast[Optional[List[String]]]().init_pointee_move(
+                _deser_opt_list_string(json, key)
+            )
+        elif field_type_name == _LIST_LIST_INT_NAME:
+            ptr.destroy_pointee()
+            ptr.bitcast[List[List[Int]]]().init_pointee_move(
+                _deser_list_list_int(json, key)
+            )
+        elif field_type_name == _LIST_LIST_STRING_NAME:
+            ptr.destroy_pointee()
+            ptr.bitcast[List[List[String]]]().init_pointee_move(
+                _deser_list_list_string(json, key)
             )
         # ----- Nested struct (fill existing default in-place) -----
         elif reflect[field_type]().is_struct():
@@ -646,6 +852,259 @@ def _deser_list_bool(json: Value, key: String) raises -> List[Bool]:
     return result^
 
 
+# --- Dict[String, T] deserialization ---
+
+
+def _deser_dict_string_int(
+    json: Value, key: String
+) raises -> Dict[String, Int]:
+    var raw = json.get(key)
+    var obj = loads(raw)
+    if not obj.is_object():
+        raise _field_type_error(key, "object", obj)
+    var result = Dict[String, Int]()
+    var keys = obj.object_keys()
+    for i in range(len(keys)):
+        var k = keys[i]
+        var v = obj[k]
+        if not v.is_int():
+            raise Error(
+                "Value at '"
+                + key
+                + "."
+                + k
+                + "' expected int, got "
+                + _type_label(v)
+            )
+        result[k] = Int(v.int_value())
+    return result^
+
+
+def _deser_dict_string_string(
+    json: Value, key: String
+) raises -> Dict[String, String]:
+    var raw = json.get(key)
+    var obj = loads(raw)
+    if not obj.is_object():
+        raise _field_type_error(key, "object", obj)
+    var result = Dict[String, String]()
+    var keys = obj.object_keys()
+    for i in range(len(keys)):
+        var k = keys[i]
+        var v = obj[k]
+        if not v.is_string():
+            raise Error(
+                "Value at '"
+                + key
+                + "."
+                + k
+                + "' expected string, got "
+                + _type_label(v)
+            )
+        result[k] = v.string_value()
+    return result^
+
+
+def _deser_dict_string_float64(
+    json: Value, key: String
+) raises -> Dict[String, Float64]:
+    var raw = json.get(key)
+    var obj = loads(raw)
+    if not obj.is_object():
+        raise _field_type_error(key, "object", obj)
+    var result = Dict[String, Float64]()
+    var keys = obj.object_keys()
+    for i in range(len(keys)):
+        var k = keys[i]
+        var v = obj[k]
+        if v.is_float():
+            result[k] = v.float_value()
+        elif v.is_int():
+            result[k] = Float64(v.int_value())
+        else:
+            raise Error(
+                "Value at '"
+                + key
+                + "."
+                + k
+                + "' expected number, got "
+                + _type_label(v)
+            )
+    return result^
+
+
+def _deser_dict_string_bool(
+    json: Value, key: String
+) raises -> Dict[String, Bool]:
+    var raw = json.get(key)
+    var obj = loads(raw)
+    if not obj.is_object():
+        raise _field_type_error(key, "object", obj)
+    var result = Dict[String, Bool]()
+    var keys = obj.object_keys()
+    for i in range(len(keys)):
+        var k = keys[i]
+        var v = obj[k]
+        if not v.is_bool():
+            raise Error(
+                "Value at '"
+                + key
+                + "."
+                + k
+                + "' expected bool, got "
+                + _type_label(v)
+            )
+        result[k] = v.bool_value()
+    return result^
+
+
+# --- List[Optional[T]] deserialization ---
+
+
+def _deser_list_opt_int(json: Value, key: String) raises -> List[Optional[Int]]:
+    var raw = json.get(key)
+    var arr = loads(raw)
+    if not arr.is_array():
+        raise _field_type_error(key, "array", arr)
+    var items = arr.array_items()
+    var result = List[Optional[Int]]()
+    for i in range(len(items)):
+        if items[i].is_null():
+            result.append(None)
+        elif items[i].is_int():
+            result.append(Int(items[i].int_value()))
+        else:
+            raise Error(
+                "Element "
+                + String(i)
+                + " of '"
+                + key
+                + "' expected int or null, got "
+                + _type_label(items[i])
+            )
+    return result^
+
+
+def _deser_list_opt_string(
+    json: Value, key: String
+) raises -> List[Optional[String]]:
+    var raw = json.get(key)
+    var arr = loads(raw)
+    if not arr.is_array():
+        raise _field_type_error(key, "array", arr)
+    var items = arr.array_items()
+    var result = List[Optional[String]]()
+    for i in range(len(items)):
+        if items[i].is_null():
+            result.append(None)
+        elif items[i].is_string():
+            result.append(items[i].string_value())
+        else:
+            raise Error(
+                "Element "
+                + String(i)
+                + " of '"
+                + key
+                + "' expected string or null, got "
+                + _type_label(items[i])
+            )
+    return result^
+
+
+# --- Optional[List[T]] deserialization ---
+
+
+def _deser_opt_list_int(json: Value, key: String) raises -> Optional[List[Int]]:
+    if not _has_key(json, key) or _is_null_field(json, key):
+        return None
+    return _deser_list_int(json, key)
+
+
+def _deser_opt_list_string(
+    json: Value, key: String
+) raises -> Optional[List[String]]:
+    if not _has_key(json, key) or _is_null_field(json, key):
+        return None
+    return _deser_list_string(json, key)
+
+
+# --- List[List[T]] deserialization ---
+
+
+def _deser_list_list_int(json: Value, key: String) raises -> List[List[Int]]:
+    var raw = json.get(key)
+    var arr = loads(raw)
+    if not arr.is_array():
+        raise _field_type_error(key, "array", arr)
+    var outer = arr.array_items()
+    var result = List[List[Int]]()
+    for i in range(len(outer)):
+        if not outer[i].is_array():
+            raise Error(
+                "Element "
+                + String(i)
+                + " of '"
+                + key
+                + "' expected array, got "
+                + _type_label(outer[i])
+            )
+        var inner = outer[i].array_items()
+        var row = List[Int]()
+        for j in range(len(inner)):
+            if not inner[j].is_int():
+                raise Error(
+                    "Element ["
+                    + String(i)
+                    + "]["
+                    + String(j)
+                    + "] of '"
+                    + key
+                    + "' expected int, got "
+                    + _type_label(inner[j])
+                )
+            row.append(Int(inner[j].int_value()))
+        result.append(row^)
+    return result^
+
+
+def _deser_list_list_string(
+    json: Value, key: String
+) raises -> List[List[String]]:
+    var raw = json.get(key)
+    var arr = loads(raw)
+    if not arr.is_array():
+        raise _field_type_error(key, "array", arr)
+    var outer = arr.array_items()
+    var result = List[List[String]]()
+    for i in range(len(outer)):
+        if not outer[i].is_array():
+            raise Error(
+                "Element "
+                + String(i)
+                + " of '"
+                + key
+                + "' expected array, got "
+                + _type_label(outer[i])
+            )
+        var inner = outer[i].array_items()
+        var row = List[String]()
+        for j in range(len(inner)):
+            if not inner[j].is_string():
+                raise Error(
+                    "Element ["
+                    + String(i)
+                    + "]["
+                    + String(j)
+                    + "] of '"
+                    + key
+                    + "' expected string, got "
+                    + _type_label(inner[j])
+                )
+            row.append(inner[j].string_value())
+        result.append(row^)
+    return result^
+
+
 # ===================================================================
 # Utilities
 # ===================================================================
@@ -700,3 +1159,62 @@ def _field_type_error(field: String, expected: String, got: Value) -> Error:
         + ", got "
         + _type_label(got)
     )
+
+
+# ===================================================================
+# v0.3 redesign sketch
+# ===================================================================
+#
+# The current `_ser` / `_deser_fill` dispatch is a long if/elif chain
+# keyed on `reflect[T]().name()`. It works, but every new combinator
+# (Dict[String, T], List[Optional[T]], List[List[T]], ...) requires a
+# new precomputed name constant + ser arm + deser arm + helper trio.
+# That does not compose: List[Dict[String, List[Int]]] needs an
+# explicit entry, and so does every nested permutation.
+#
+# v0.3 should replace the name-string switch with a per-field trait
+# dispatch. Sketch:
+#
+#     trait JsonField:
+#         """One field's JSON codec. Implementations are auto-derived
+#         for primitives, Optional, List, Dict, and tuples; users can
+#         specialize for custom types without touching reflection.mojo.
+#         """
+#
+#         alias FieldType: AnyType
+#
+#         @staticmethod
+#         fn write(value: Self.FieldType, mut out: String) raises
+#
+#         @staticmethod
+#         fn read(json: Value) raises -> Self.FieldType
+#
+# Auto-derivation rules (compile-time):
+#
+#   - JsonField for Int, Int64, Bool, Float32, Float64, String, Value:
+#       built-in.
+#   - JsonField for Optional[T] where T : JsonField:
+#       null -> None, else delegate to JsonField[T].
+#   - JsonField for List[T] where T : JsonField:
+#       walk array, delegate per element.
+#   - JsonField for Dict[String, T] where T : JsonField:
+#       walk object, delegate per value.
+#   - JsonField for any reflected struct: delegate to per-field
+#       JsonField for every field, then assemble.
+#
+# This is structurally how serde works in Rust and how Pydantic v2 works
+# in Python. The win is composability: List[Dict[String, List[Int]]]
+# falls out for free, custom JsonField impls are local to the user
+# struct, and reflection.mojo shrinks to the auto-derivation glue.
+#
+# The current name-string approach stays in v0.2 because Mojo's trait
+# system does not yet support the full set of bound checks needed to
+# auto-derive JsonField generically over T : JsonField. See:
+#   - bound checks on parametric trait conformance,
+#   - default-method dispatch for parameterized traits,
+#   - lifetime/move semantics on trait return types.
+#
+# When those land, port the current arms one at a time, keeping the
+# existing tests as the contract, and delete this file's name-string
+# constants once the trait implementations cover them.
+#

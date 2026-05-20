@@ -169,21 +169,18 @@ def _extract_array_element(raw: String, index: Int) raises -> String:
     var n = len(raw_bytes)
     var i = 0
     var current_index = 0
-    var depth = 0
 
     while i < n and (
-        raw_bytes[i] == UInt8(ord("["))
-        or raw_bytes[i] == UInt8(ord(" "))
+        raw_bytes[i] == UInt8(ord(" "))
         or raw_bytes[i] == UInt8(ord("\t"))
         or raw_bytes[i] == UInt8(ord("\n"))
         or raw_bytes[i] == UInt8(ord("\r"))
     ):
-        if raw_bytes[i] == UInt8(ord("[")):
-            depth = 1
         i += 1
 
-    if depth == 0:
+    if i >= n or raw_bytes[i] != UInt8(ord("[")):
         raise Error("Invalid JSON array")
+    i += 1
 
     while i < n:
         while i < n and (

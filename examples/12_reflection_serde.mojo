@@ -7,6 +7,8 @@ to_json() or from_json() methods.
 Supported field types:
     Scalars: Int, Int64, Bool, Float64, Float32, String
     Containers: List[Int/String/Float64/Bool], Optional[Int/String/Float64/Bool]
+    v0.2 combinators: Dict[String, T], List[Optional[T]],
+                      Optional[List[T]], List[List[T]] (T scalar)
     Nested structs, Value (raw JSON pass-through)
 """
 
@@ -20,7 +22,7 @@ from json import (
     JsonSerializable,
     JsonDeserializable,
 )
-from std.collections import Optional, List
+from std.collections import Optional, List, Dict
 
 
 # ===================================================================
@@ -114,6 +116,22 @@ struct Color(JsonSerializable, Defaultable, Movable):
             + ")"
         )
         return loads('"' + s + '"')
+
+
+@fieldwise_init
+struct Stats(Defaultable, Movable):
+    """V0.2 combinator demo struct."""
+
+    var counts: Dict[String, Int]
+    var labels: List[Optional[String]]
+    var maybe_scores: Optional[List[Int]]
+    var matrix: List[List[Int]]
+
+    def __init__(out self):
+        self.counts = Dict[String, Int]()
+        self.labels = List[Optional[String]]()
+        self.maybe_scores = None
+        self.matrix = List[List[Int]]()
 
 
 @fieldwise_init
@@ -313,6 +331,48 @@ def example_custom_traits() raises:
     print()
 
 
+def example_combinator_types() raises:
+    """V0.2 Phase F: Dict, nested lists, Optional<->List combinators."""
+    print("=== Combinator Types (v0.2) ===\n")
+
+    var s = Stats()
+    s.counts["wins"] = 7
+    s.counts["losses"] = 2
+
+    s.labels = List[Optional[String]]()
+    s.labels.append(String("alpha"))
+    s.labels.append(None)
+    s.labels.append(String("gamma"))
+
+    var scores = List[Int]()
+    scores.append(95)
+    scores.append(88)
+    s.maybe_scores = scores^
+
+    var row1 = List[Int]()
+    row1.append(1)
+    row1.append(2)
+    var row2 = List[Int]()
+    row2.append(3)
+    row2.append(4)
+    s.matrix.append(row1^)
+    s.matrix.append(row2^)
+
+    var json = serialize_json(s)
+    print("Serialized:", json)
+
+    var back = deserialize_json[Stats](json)
+    print("counts.wins =", back.counts["wins"])
+    print("labels[0]   =", back.labels[0].value())
+    print("labels[1]   =", "None" if not back.labels[1] else back.labels[1].value())
+    print(
+        "scores[0]   =",
+        back.maybe_scores.value()[0] if back.maybe_scores else -1,
+    )
+    print("matrix[1][1]=", back.matrix[1][1])
+    print()
+
+
 def example_error_messages() raises:
     """Rich error messages tell you exactly what went wrong."""
     print("=== Error Messages ===\n")
@@ -347,6 +407,7 @@ def main() raises:
     example_try_deserialize()
     example_value_api()
     example_custom_traits()
+    example_combinator_types()
     example_error_messages()
 
     print("=" * 50)

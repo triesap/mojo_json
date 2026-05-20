@@ -1,7 +1,7 @@
 """Tests for reflection-based JSON serialization and deserialization."""
 
 from std.testing import assert_equal, assert_true, assert_raises
-from std.collections import Optional, List
+from std.collections import Optional, List, Dict
 from json import loads, Value, Null
 from json.reflection import (
     serialize_json,
@@ -553,6 +553,146 @@ def test_custom_deserialize() raises:
 
 
 # ===================================================================
+# Phase F combinator types: Dict[String, T], nested lists, Optional<->List
+# ===================================================================
+
+
+@fieldwise_init
+struct CombinatorBox(Defaultable, Movable):
+    var counts: Dict[String, Int]
+    var labels: Dict[String, String]
+    var tags: List[Optional[String]]
+    var maybe_ids: Optional[List[Int]]
+    var matrix: List[List[Int]]
+
+    def __init__(out self):
+        self.counts = Dict[String, Int]()
+        self.labels = Dict[String, String]()
+        self.tags = List[Optional[String]]()
+        self.maybe_ids = None
+        self.matrix = List[List[Int]]()
+
+
+def test_serialize_dict_string_int() raises:
+    var d = Dict[String, Int]()
+    d["a"] = 1
+    d["b"] = 2
+    var json = serialize_json(d)
+    var parsed = loads(json)
+    assert_true(parsed.is_object())
+    assert_equal(parsed["a"].int_value(), 1)
+    assert_equal(parsed["b"].int_value(), 2)
+    print("  test_serialize_dict_string_int passed")
+
+
+def test_serialize_dict_string_string() raises:
+    var d = Dict[String, String]()
+    d["en"] = String("hello")
+    d["es"] = String("hola")
+    var json = serialize_json(d)
+    var parsed = loads(json)
+    assert_equal(parsed["en"].string_value(), String("hello"))
+    assert_equal(parsed["es"].string_value(), String("hola"))
+    print("  test_serialize_dict_string_string passed")
+
+
+def test_serialize_list_optional_int() raises:
+    var lst = List[Optional[Int]]()
+    lst.append(Int(1))
+    lst.append(None)
+    lst.append(Int(3))
+    var json = serialize_json(lst)
+    assert_equal(json, "[1,null,3]")
+    print("  test_serialize_list_optional_int passed")
+
+
+def test_serialize_optional_list_int_present() raises:
+    var lst = List[Int]()
+    lst.append(1)
+    lst.append(2)
+    lst.append(3)
+    var opt: Optional[List[Int]] = lst^
+    var json = serialize_json(opt)
+    assert_equal(json, "[1,2,3]")
+    print("  test_serialize_optional_list_int_present passed")
+
+
+def test_serialize_optional_list_int_none() raises:
+    var opt = Optional[List[Int]](None)
+    var json = serialize_json(opt)
+    assert_equal(json, "null")
+    print("  test_serialize_optional_list_int_none passed")
+
+
+def test_serialize_list_list_int() raises:
+    var inner_a = List[Int]()
+    inner_a.append(1)
+    inner_a.append(2)
+    var inner_b = List[Int]()
+    inner_b.append(3)
+    var outer = List[List[Int]]()
+    outer.append(inner_a^)
+    outer.append(inner_b^)
+    var json = serialize_json(outer)
+    assert_equal(json, "[[1,2],[3]]")
+    print("  test_serialize_list_list_int passed")
+
+
+def test_round_trip_combinator_box() raises:
+    var box = CombinatorBox()
+    box.counts["a"] = 1
+    box.counts["b"] = 2
+    box.labels["k"] = String("v")
+
+    box.tags = List[Optional[String]]()
+    box.tags.append(String("x"))
+    box.tags.append(None)
+    box.tags.append(String("y"))
+
+    var ids = List[Int]()
+    ids.append(7)
+    ids.append(8)
+    box.maybe_ids = ids^
+
+    var row1 = List[Int]()
+    row1.append(1)
+    row1.append(2)
+    var row2 = List[Int]()
+    row2.append(3)
+    box.matrix = List[List[Int]]()
+    box.matrix.append(row1^)
+    box.matrix.append(row2^)
+
+    var json = serialize_json(box)
+    var back = deserialize_json[CombinatorBox](json)
+
+    assert_equal(back.counts["a"], 1)
+    assert_equal(back.counts["b"], 2)
+    assert_equal(back.labels["k"], String("v"))
+    assert_equal(len(back.tags), 3)
+    assert_equal(back.tags[0].value(), String("x"))
+    assert_true(not back.tags[1])
+    assert_equal(back.tags[2].value(), String("y"))
+    assert_true(back.maybe_ids.__bool__())
+    assert_equal(back.maybe_ids.value()[0], 7)
+    assert_equal(back.maybe_ids.value()[1], 8)
+    assert_equal(len(back.matrix), 2)
+    assert_equal(back.matrix[0][0], 1)
+    assert_equal(back.matrix[0][1], 2)
+    assert_equal(back.matrix[1][0], 3)
+    print("  test_round_trip_combinator_box passed")
+
+
+def test_round_trip_combinator_box_null_optional_list() raises:
+    var box = CombinatorBox()
+    box.maybe_ids = None
+    var json = serialize_json(box)
+    var back = deserialize_json[CombinatorBox](json)
+    assert_true(not back.maybe_ids)
+    print("  test_round_trip_combinator_box_null_optional_list passed")
+
+
+# ===================================================================
 # Runner
 # ===================================================================
 
@@ -608,6 +748,17 @@ def main() raises:
     print("Custom traits:")
     test_custom_serialize()
     test_custom_deserialize()
+    print()
+
+    print("Combinator types (Phase F):")
+    test_serialize_dict_string_int()
+    test_serialize_dict_string_string()
+    test_serialize_list_optional_int()
+    test_serialize_optional_list_int_present()
+    test_serialize_optional_list_int_none()
+    test_serialize_list_list_int()
+    test_round_trip_combinator_box()
+    test_round_trip_combinator_box_null_optional_list()
     print()
 
     print("All reflection serde tests passed!")

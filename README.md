@@ -30,7 +30,7 @@ print(dumps(data, indent="  "))  # Pretty print
 var config = load("config.json")
 var logs = load[format="ndjson"]("events.ndjson")  # Returns List[Value]
 
-# Explicit GPU parsing (NVIDIA / AMD; Apple Silicon raises -- see CHANGELOG)
+# Explicit GPU parsing (NVIDIA / AMD; Apple Silicon raises by default)
 var big = load[target="gpu"]("large.json")
 ```
 
