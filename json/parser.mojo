@@ -11,7 +11,7 @@ from .cpu import SimdjsonFFI, SIMDJSON_TYPE_NULL, SIMDJSON_TYPE_BOOL
 from .cpu import SIMDJSON_TYPE_INT64, SIMDJSON_TYPE_UINT64
 from .cpu import SIMDJSON_TYPE_DOUBLE, SIMDJSON_TYPE_STRING
 from .cpu import SIMDJSON_TYPE_ARRAY, SIMDJSON_TYPE_OBJECT
-from .cpu import parse_mojo, parse_simd
+from .cpu import parse_mojo, parse_simd, parse_cpu_native
 from .types import JSONInput, JSONResult
 from .gpu import parse_json_gpu
 from .iterator import JSONIterator
@@ -66,15 +66,22 @@ def _parse_cpu_simdjson(s: String) raises -> Value:
 
 
 def _parse_cpu_mojo(s: String) raises -> Value:
-    """Parse JSON using pure Mojo backend (SIMD-accelerated)."""
-    return parse_simd(s)
+    """Parse JSON using the v0.2 two-pass CPU parser (stage 1 + stage 2).
+
+    The stage 1 default is the scalar oracle. To benchmark with the SIMD
+    stage 1 instead, callers can route through
+    `cpu.parse_cpu_native[force_scalar=False]` directly. See
+    `json/.cursor/rules/design-0.2.mdc` Phase C for the rationale.
+    """
+    return parse_cpu_native(s)
 
 
 def _parse_cpu[backend: StaticString = "simdjson"](s: String) raises -> Value:
     """Parse JSON using specified CPU backend.
 
     Parameters:
-        backend: "simdjson" (default, FFI) or "mojo" (pure native).
+        backend: "simdjson" (default, FFI) or "mojo" (v0.2 two-pass
+            native parser).
 
     Args:
         s: JSON string to parse.
