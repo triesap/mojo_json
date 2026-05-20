@@ -22,11 +22,14 @@ from .raw_ops import (
     _extract_array_element,
     _count_array_elements,
     _extract_object_keys,
-    _update_object_value,
-    _add_object_key,
-    _update_array_element,
-    _append_to_array,
     _parse_json_pointer,
+)
+from .owned import (
+    OwnedValue,
+    _materialize_for_write,
+    _serialize_into_value,
+    _set_at_pointer,
+    _value_to_owned,
 )
 from ..unicode import unescape_json_string
 
@@ -386,6 +389,10 @@ struct Value(Copyable, Movable, Writable):
     def set(mut self, key: String, value: Value) raises:
         """Set or update a value in a JSON object.
 
+        Routes through `OwnedValue` so the in-memory tree stays the source of
+        truth for the mutation. The view is then re-serialized so subsequent
+        reads via `raw_json()` / `__str__()` observe the new state.
+
         Args:
             key: Object key.
             value: New value to set.
@@ -398,20 +405,25 @@ struct Value(Copyable, Movable, Writable):
         if not self.is_object():
             raise Error("set() can only be called on JSON objects")
 
-        var value_json = _value_to_json(value)
+        var owned = _materialize_for_write(self)
+        var owned_value = _value_to_owned(value)
 
-        var found = False
-        for i in range(len(self._keys)):
-            if self._keys[i] == key:
-                found = True
+        var key_pos = -1
+        for i in range(len(owned.object_keys)):
+            if owned.object_keys[i] == key:
+                key_pos = i
                 break
 
-        if found:
-            self._raw = _update_object_value(self._raw, key, value_json)
+        if key_pos >= 0:
+            owned.object_values[key_pos] = owned_value^
         else:
-            self._keys.append(key)
-            self._count += 1
-            self._raw = _add_object_key(self._raw, key, value_json)
+            owned.object_keys.append(key)
+            owned.object_values.append(owned_value^)
+
+        var rebuilt = _serialize_into_value(owned)
+        self._raw = rebuilt._raw
+        self._keys = rebuilt._keys.copy()
+        self._count = rebuilt._count
 
     def set(mut self, index: Int, value: Value) raises:
         """Set a value at an array index.
@@ -429,8 +441,13 @@ struct Value(Copyable, Movable, Writable):
         if index < 0 or index >= self._count:
             raise Error("Array index out of bounds: " + String(index))
 
-        var value_json = _value_to_json(value)
-        self._raw = _update_array_element(self._raw, index, value_json)
+        var owned = _materialize_for_write(self)
+        var owned_value = _value_to_owned(value)
+        owned.array_val[index] = owned_value^
+
+        var rebuilt = _serialize_into_value(owned)
+        self._raw = rebuilt._raw
+        self._count = rebuilt._count
 
     def append(mut self, value: Value) raises:
         """Append a value to a JSON array.
@@ -445,9 +462,55 @@ struct Value(Copyable, Movable, Writable):
         if not self.is_array():
             raise Error("append() can only be called on JSON arrays")
 
-        var value_json = _value_to_json(value)
-        self._count += 1
-        self._raw = _append_to_array(self._raw, value_json)
+        var owned = _materialize_for_write(self)
+        var owned_value = _value_to_owned(value)
+        owned.array_val.append(owned_value^)
+
+        var rebuilt = _serialize_into_value(owned)
+        self._raw = rebuilt._raw
+        self._count = rebuilt._count
+
+    def set_at(mut self, pointer: String, value: Value) raises:
+        """Set a nested value via JSON Pointer (RFC 6901).
+
+        Unlike chained `__getitem__`, this propagates the mutation through the
+        full parent chain. Intermediate objects/arrays are created or updated
+        as required by the pointer; missing scalar parents raise.
+
+        Args:
+            pointer: JSON Pointer string (`""` for root, `"/a/b"` for nested).
+            value: New value to install at `pointer`.
+
+        Example:
+            var doc = loads('{"a":{"b":1}}')
+            doc.set_at("/a/b", Value(42))  # Result is `{"a":{"b":42}}`.
+        """
+        if pointer == "":
+            # Whole-document replacement.
+            self._type = value._type
+            self._bool = value._bool
+            self._int = value._int
+            self._float = value._float
+            self._string = value._string
+            self._raw = value._raw
+            self._keys = value._keys.copy()
+            self._count = value._count
+            return
+
+        var tokens = _parse_json_pointer(pointer)
+        var tree = _materialize_for_write(self)
+        var new_val = _value_to_owned(value)
+        _set_at_pointer(tree, tokens, 0, new_val^)
+
+        var rebuilt = _serialize_into_value(tree)
+        self._type = rebuilt._type
+        self._bool = rebuilt._bool
+        self._int = rebuilt._int
+        self._float = rebuilt._float
+        self._string = rebuilt._string
+        self._raw = rebuilt._raw
+        self._keys = rebuilt._keys.copy()
+        self._count = rebuilt._count
 
     def at(self, pointer: String) raises -> Value:
         """Navigate to a value using JSON Pointer (RFC 6901).
