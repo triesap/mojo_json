@@ -1,76 +1,91 @@
 # Architecture
 
-json provides a unified API with multiple high-performance backends: CPU (simdjson FFI or pure Mojo) and GPU (native Mojo kernels).
+In v0.2 the library is built around a single in-memory representation:
+a tape-backed `Document` plus a lightweight `Value` view. Every CPU and
+GPU pipeline funnels into the same shape, so the rest of the library
+(LazyValue, JSONPath, JSON Patch, schema validation, reflection serde)
+operates on one model.
 
 ## System Overview
 
 ```mermaid
 graph TB
-    subgraph "json API"
-        loads["loads(json_string)"]
-        dumps["dumps(value)"]
+    subgraph "Public API"
+        loads["loads(s)"]
+        dumps["dumps(v)"]
     end
 
-    subgraph "CPU Backend - Pure Mojo (Default)"
-        mojo_parser["MojoJSONParser"]
-        mojo_parse["Zero-FFI Parsing"]
+    subgraph "CPU - default (parse_cpu_native)"
+        stage1["Stage 1: scalar | SIMD structural index"]
+        stage2["Stage 2: walk index, build Value"]
     end
 
-    subgraph "CPU Backend - simdjson FFI"
-        simdjson["simdjson FFI"]
-        cpu_parse["Parse & Build Value Tree"]
+    subgraph "CPU - simdjson FFI (target='cpu-simdjson')"
+        simdjson["simdjson C++ via FFI"]
+        ffi_adapt["FFI -> Value adapter"]
     end
 
-    subgraph "GPU Backend"
-        gpu_kernels["GPU Kernels"]
-        stream_compact["Stream Compaction"]
-        bracket_match["Bracket Matching"]
-        tree_build["Value Tree Builder"]
+    subgraph "GPU - target='gpu' (NVIDIA / AMD)"
+        gpu_kernels["GPU kernels (fused structural scan)"]
+        tape_adapter["gpu/tape_adapter.parse_gpu_to_value"]
     end
 
-    loads -->|"default"| mojo_parser
-    loads -->|"target='cpu-simdjson'"| simdjson
-    loads -->|"target='gpu'"| gpu_kernels
-    simdjson --> cpu_parse
-    mojo_parser --> mojo_parse
-    gpu_kernels --> stream_compact
-    stream_compact --> bracket_match
-    bracket_match --> tree_build
-    cpu_parse --> dumps
-    mojo_parse --> dumps
-    tree_build --> dumps
+    document["Document + Tape (single source of truth)"]
+
+    loads -->|default| stage1
+    loads -->|cpu-simdjson| simdjson
+    loads -->|gpu| gpu_kernels
+    stage1 --> stage2 --> document
+    simdjson --> ffi_adapt --> document
+    gpu_kernels --> tape_adapter --> document
+    document --> dumps
 ```
+
+Apple Silicon `target='gpu'` raises by default (Metal backend lacks
+raw-pointer kernels in the current Mojo nightly). Recompile with
+`-D JSON_GPU_ALLOW_APPLE_FALLBACK=1` to opt into the legacy silent CPU
+fallback.
 
 ## CPU Backends
 
-### Pure Mojo Backend (Default)
+### Pure Mojo Backend (Default) -- v0.2 two-pass parser
 
-**Implementation:** Native Mojo JSON parser with optimized parsing
+**Implementation:** Stage 1 builds a structural index of every byte
+offset whose character is `{ } [ ] : , "` (outside string literals).
+Stage 2 walks that index to produce a `Value` tree without re-scanning
+bytes for structure.
 
 **Location:**
-- `json/cpu/mojo_backend.mojo` - MojoJSONParser struct
-- `json/cpu/types.mojo` - Common JSON type constants
+- `json/cpu/stage1_scalar.mojo` -- byte-by-byte oracle (canonical;
+  used for correctness validation of the SIMD path).
+- `json/cpu/stage1.mojo` -- 32-byte SIMD scan via
+  `memory.unsafe.pack_bits`.
+- `json/cpu/stage2.mojo` -- index walker; emits `Value`. Strict
+  validation for trailing commas, double commas, leading zeros,
+  missing colons, missing values, unquoted keys, invalid escapes,
+  and trailing top-level content.
+- `json/cpu/__init__.parse_cpu_native[force_scalar=True|False]` --
+  the public CPU entry point.
+- `tests/test_stage1_equivalence.mojo` -- asserts stage 1 SIMD and
+  scalar produce byte-identical position lists.
 
-**Performance:** ~1.31 GB/s (on twitter.json)
+**Performance:** ~1.4 GB/s (twitter.json, scalar stage 1; SIMD
+matches scalar within noise on this workload because JSON has many
+small structural runs that don't amortize the SIMD setup cost).
 
 **Usage:**
 ```mojo
 from json import loads
-var data = loads('{"key": "value"}')  # Default is Mojo backend
+var data = loads('{"key": "value"}')  # default
 ```
-
-**Benefits:**
-- Zero external dependencies (no libsimdjson required)
-- 30% faster than FFI due to no marshalling overhead
-- Easier deployment (single Mojo binary)
 
 ### simdjson FFI Backend
 
 **Implementation:** FFI wrapper around [simdjson](https://github.com/simdjson/simdjson)
 
 **Location:**
-- `json/cpu/simdjson_ffi/` - C++ wrapper
-- `json/cpu/simdjson_ffi.mojo` - Mojo FFI bindings
+- `json/cpu/simdjson_ffi/` -- C++ wrapper
+- `json/cpu/simdjson_ffi.mojo` -- Mojo FFI bindings
 
 **Performance:** ~0.48 GB/s (on twitter.json)
 
@@ -82,17 +97,19 @@ var data = loads[target="cpu-simdjson"]('{"key": "value"}')
 
 ### CPU Parsing Flow (simdjson)
 
-1. Load JSON string into memory
-2. Call simdjson via FFI (`json/cpu/simdjson_ffi.mojo`)
-3. Recursively build `Value` tree from simdjson result
-4. Return parsed `Value`
+1. Load JSON string into memory.
+2. Call simdjson via FFI (`json/cpu/simdjson_ffi.mojo`).
+3. Recursively build `Value` tree from the simdjson result.
+4. Return parsed `Value`.
 
-### CPU Parsing Flow (Pure Mojo)
+### CPU Parsing Flow (default, two-pass)
 
-1. Copy JSON bytes to internal buffer
-2. Recursive descent parsing with `MojoJSONParser`
-3. Build `Value` tree directly
-4. Return parsed `Value`
+1. **Stage 1:** scan bytes once, emitting offsets of structural
+   characters outside strings.
+2. **Stage 2:** walk the structural index in O(structural_count),
+   recursively constructing `Value` for objects, arrays, strings,
+   numbers, and primitives. No byte-level re-scan.
+3. Return parsed `Value`.
 
 ## GPU Backend
 
@@ -132,8 +149,8 @@ flowchart LR
     end
 
     subgraph "Phase 4: Build"
-        G --> H[Bracket Matching]
-        H --> I[Value Tree]
+        G --> H[gpu/tape_adapter.parse_gpu_to_value]
+        H --> I[Value via Stage 2]
     end
 
     style A fill:#e1f5fe
@@ -149,7 +166,7 @@ flowchart LR
    - Extract structural character bitmap
 3. **Stream Compaction (GPU):** Extract only the positions of structural characters (~50ms)
 4. **Device-to-Host Transfer:** Copy compact position array back to CPU
-5. **Bracket Matching (CPU):** Match brackets using stack algorithm (~10ms)
+5. **Tape Adapter (CPU):** `gpu/tape_adapter.parse_gpu_to_value` merges the GPU `{ } [ ] : ,` positions with a small CPU quote-only scan to produce a stage1-compatible `StructuralIndex`, then runs **stage 2** to construct the `Value`. The v0.1 byte-level re-scan in `_build_array` / `_build_object` is gone.
 6. **Value Tree Construction (CPU):** Build `Value` tree from structural info
 
 ### Why Hybrid GPU/CPU?

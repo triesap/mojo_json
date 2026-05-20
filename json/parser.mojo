@@ -11,7 +11,7 @@ from .cpu import SimdjsonFFI, SIMDJSON_TYPE_NULL, SIMDJSON_TYPE_BOOL
 from .cpu import SIMDJSON_TYPE_INT64, SIMDJSON_TYPE_UINT64
 from .cpu import SIMDJSON_TYPE_DOUBLE, SIMDJSON_TYPE_STRING
 from .cpu import SIMDJSON_TYPE_ARRAY, SIMDJSON_TYPE_OBJECT
-from .cpu import parse_mojo, parse_simd, parse_cpu_native
+from .cpu import parse_cpu_native
 from .types import JSONInput, JSONResult
 from .gpu import parse_json_gpu, parse_gpu_to_value
 
@@ -436,6 +436,43 @@ def _list_to_array_value(values: List[Value]) -> Value:
     return make_array_value(raw, count)
 
 
+def load[
+    target: StaticString = "cpu",
+    format: StaticString = "json",
+](path: String) raises -> List[Value]:
+    """Load NDJSON from file path -> `List[Value]` (matches `loads[format='ndjson']`).
+
+    Parameters:
+        target: "cpu" (default), "cpu-simdjson", or "gpu".
+        format: Must be "ndjson" for this overload.
+
+    Args:
+        path: Path to a `.ndjson` file.
+
+    Returns:
+        List of parsed Values (one per non-empty line).
+
+    Example:
+        var events = load[format="ndjson"]("logs.ndjson")
+        for event in events:
+            print(event["msg"].string_value()).
+
+    Note:
+        v0.2 unifies the NDJSON return type with `loads[format='ndjson']`.
+        The plain-extension auto-detection (`load("x.ndjson") -> Value`)
+        still works for backward compatibility but wraps the records in an
+        array Value. New code should prefer this typed overload.
+    """
+
+    comptime if format != "ndjson":
+        comptime assert False, "Use format='ndjson' for List[Value] return type"
+
+    var f = open(path, "r")
+    var content = f.read()
+    f.close()
+    return loads[target, format="ndjson"](content)
+
+
 def load[streaming: Bool](path: String) raises -> StreamingParser:
     """Stream large files line by line (CPU only, for memory efficiency).
 
@@ -465,13 +502,8 @@ def load[streaming: Bool](path: String) raises -> StreamingParser:
     return StreamingParser(path)
 
 
-# Backwards compatibility aliases (deprecated, use loads/load instead)
-def loads_with_config[
-    target: StaticString = "cpu"
-](s: String, config: ParserConfig) raises -> Value:
-    """Deprecated: Use loads(s, config) instead."""
-    return loads[target](s, config)
-
+# loads_with_config was removed in v0.2-E. Use `loads(s, config)` instead --
+# the dual-arity overload renders the deprecated alias redundant.
 
 from .config import ParserConfig
 from .lazy import LazyValue

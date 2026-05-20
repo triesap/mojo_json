@@ -8,7 +8,7 @@ struct ParserConfig:
 
     Example:
         var config = ParserConfig(max_depth=10, allow_comments=True)
-        var data = loads_with_config(json_str, config).
+        var data = loads(json_str, config).
     """
 
     var max_depth: Int

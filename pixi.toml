@@ -3,12 +3,12 @@ authors = ["ehsanmok <ehsanmok@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge", "https://prefix.dev/modular-community"]
 name = "json"
 platforms = ["linux-64", "osx-arm64"]
-version = "0.1.6"
+version = "0.2.0"
 preview = ["pixi-build"]
 
 [package]
 name = "json"
-version = "0.1.6"
+version = "0.2.0"
 
 [package.build]
 backend = { name = "pixi-build-rattler-build", version = "*" }
@@ -65,7 +65,7 @@ build = "bash json/cpu/simdjson_ffi/build.sh"
 
 # Tests (includes examples)
 tests = "mojo -I . tests/test_value.mojo && mojo -I . tests/test_parser.mojo && mojo -I . tests/test_serialize.mojo && mojo -I . tests/test_serde.mojo && mojo -I . tests/test_reflection.mojo && mojo -I . tests/test_e2e.mojo && mojo -I . tests/test_gpu.mojo && mojo -I . examples/01_basic_parsing.mojo && mojo -I . examples/02_file_operations.mojo && mojo -I . examples/03_value_types.mojo && mojo -I . examples/04_gpu_parsing.mojo && mojo -I . examples/05_error_handling.mojo && mojo -I . examples/06_struct_serde.mojo && mojo -I . examples/07_ndjson.mojo && mojo -I . examples/08_lazy_parsing.mojo && mojo -I . examples/09_jsonpath.mojo && mojo -I . examples/10_schema_validation.mojo && mojo -I . examples/11_json_patch.mojo && mojo -I . examples/12_reflection_serde.mojo"
-tests-cpu = "mojo -I . tests/test_value.mojo && mojo -I . tests/test_parser.mojo && mojo -I . tests/test_serialize.mojo && mojo -I . tests/test_serde.mojo && mojo -I . tests/test_reflection.mojo && mojo -I . tests/test_jsonpath.mojo && mojo -I . tests/test_mojo_backend.mojo && mojo -I . tests/test_patch.mojo && mojo -I . tests/test_schema.mojo && mojo -I . examples/01_basic_parsing.mojo && mojo -I . examples/02_file_operations.mojo && mojo -I . examples/03_value_types.mojo && mojo -I . examples/05_error_handling.mojo && mojo -I . examples/08_lazy_parsing.mojo && mojo -I . examples/09_jsonpath.mojo && mojo -I . examples/10_schema_validation.mojo && mojo -I . examples/11_json_patch.mojo && mojo -I . examples/12_reflection_serde.mojo"
+tests-cpu = "mojo -I . tests/test_value.mojo && mojo -I . tests/test_parser.mojo && mojo -I . tests/test_serialize.mojo && mojo -I . tests/test_serde.mojo && mojo -I . tests/test_reflection.mojo && mojo -I . tests/test_jsonpath.mojo && mojo -I . tests/test_patch.mojo && mojo -I . tests/test_schema.mojo && mojo -I . tests/test_value_mutation.mojo && mojo -I . tests/test_stage1_equivalence.mojo && mojo -I . tests/test_backend_equivalence.mojo && mojo -I . tests/test_document.mojo && mojo -I . examples/01_basic_parsing.mojo && mojo -I . examples/02_file_operations.mojo && mojo -I . examples/03_value_types.mojo && mojo -I . examples/05_error_handling.mojo && mojo -I . examples/08_lazy_parsing.mojo && mojo -I . examples/09_jsonpath.mojo && mojo -I . examples/10_schema_validation.mojo && mojo -I . examples/11_json_patch.mojo && mojo -I . examples/12_reflection_serde.mojo"
 tests-gpu = "mojo -I . tests/test_gpu.mojo && mojo -I . examples/04_gpu_parsing.mojo"
 tests-e2e = "mojo -I . tests/test_e2e.mojo"
 tests-e2e-gpu = "MOJSON_TEST_GPU=1 mojo -I . tests/test_e2e.mojo"

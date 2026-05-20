@@ -8,8 +8,9 @@ High-performance JSON library for Mojo with GPU acceleration.
 
 - **Python-like API:** `loads`, `dumps`, `load`, `dump`
 - **Reflection serde:** zero-boilerplate struct serialization via compile-time reflection
-- **GPU accelerated:** 2-4x faster than [cuJSON](https://github.com/AutomataLab/cuJSON) on large files
-- **Cross-platform:** NVIDIA, AMD, and Apple Silicon GPUs
+- **GPU accelerated:** 2-4x faster than [cuJSON](https://github.com/AutomataLab/cuJSON) on large files (NVIDIA, AMD)
+- **Tape-backed Value:** v0.2 stores parsed JSON as a packed tape inside a `Document`; `Value` is a view; nested mutation propagates correctly
+- **Two-pass CPU parser:** stage 1 builds a structural index (scalar oracle + SIMD), stage 2 walks it; ~1.4 GB/s, zero FFI
 - **Streaming and lazy parsing:** handle files larger than memory
 - **JSONPath and Schema:** query and validate JSON documents
 - **RFC compliant:** JSON Patch, Merge Patch, JSON Pointer
@@ -25,11 +26,11 @@ print(data["name"].string_value())  # Alice
 print(data["scores"][0].int_value())  # 95
 print(dumps(data, indent="  "))  # Pretty print
 
-# File I/O (auto-detects .ndjson)
+# File I/O
 var config = load("config.json")
-var logs = load("events.ndjson")  # Returns array of values
+var logs = load[format="ndjson"]("events.ndjson")  # Returns List[Value]
 
-# Explicit GPU parsing
+# Explicit GPU parsing (NVIDIA / AMD; Apple Silicon raises -- see CHANGELOG)
 var big = load[target="gpu"]("large.json")
 ```
 
@@ -43,7 +44,7 @@ channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 preview = ["pixi-build"]
 
 [dependencies]
-json = { git = "https://github.com/ehsanmok/json.git", tag = "v0.1.5" }
+json = { git = "https://github.com/ehsanmok/json.git", tag = "v0.2.0" }
 ```
 
 Then run:

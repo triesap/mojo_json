@@ -1,12 +1,20 @@
-# json CPU backends
-# Supports multiple backends:
-#   - simdjson (FFI): High-performance C++ backend (default)
-#   - mojo (native): Pure Mojo implementation (zero FFI)
+# json CPU backends.
+#
+# v0.2 ships two CPU paths:
+#   - `parse_cpu_native` (default): two-pass stage 1 + stage 2 walker.
+#       Stage 1 has scalar (`stage1_scalar`) and SIMD (`stage1`)
+#       implementations; both are byte-identical, enforced by
+#       `tests/test_stage1_equivalence.mojo`. Default is scalar; opt
+#       into SIMD with `parse_cpu_native[force_scalar=False]`.
+#   - simdjson FFI: optional C++ backend, exposed via `SimdjsonFFI`
+#       and selected with `loads[target='cpu-simdjson']`.
+#
+# The pre-v0.2 `parse_mojo` / `parse_simd` entry points (and their
+# `MojoJSONParser` / `FastParser` structs) were deleted in v0.2-E:
+# the codepaths they wrapped were dead since v0.2-A wired the
+# canonical CPU pipeline through `parse_cpu_native`.
 
-# =============================================================================
-# Common Types (backend-agnostic)
-# =============================================================================
-
+# Common type tags shared with the simdjson FFI bindings.
 from .types import (
     JSON_TYPE_NULL,
     JSON_TYPE_BOOL,
@@ -23,10 +31,7 @@ from .types import (
     JSON_ERROR_OTHER,
 )
 
-# =============================================================================
-# simdjson Backend (FFI)
-# =============================================================================
-
+# simdjson FFI backend.
 from .simdjson_ffi import (
     SimdjsonFFI,
     SIMDJSON_OK,
@@ -43,36 +48,6 @@ from .simdjson_ffi import (
     SIMDJSON_TYPE_ARRAY,
     SIMDJSON_TYPE_OBJECT,
 )
-
-# =============================================================================
-# Mojo Backend (Pure Native)
-# =============================================================================
-
-from .mojo_backend import parse_mojo, MojoJSONParser
-
-# =============================================================================
-# SIMD Backend (High-Performance Native)
-# =============================================================================
-
-from .simd_backend import parse_simd, FastParser
-
-# =============================================================================
-# Two-Pass Backend (v0.2 Stage 1 + Stage 2)
-# =============================================================================
-#
-# `parse_cpu_native` is the v0.2 entry point: stage 1 builds the
-# structural index, stage 2 walks it. Stage 1 ships in two
-# implementations -- a scalar oracle (`stage1_scalar`) and a SIMD
-# version (`stage1`). Both produce byte-identical output, enforced by
-# `tests/test_stage1_equivalence.mojo`.
-#
-# Default is the scalar stage 1: empirically, on JSON with many short
-# strings (twitter.json style) the per-position iteration cost of the
-# SIMD path's bitmask resolver dominates the per-byte cost of the
-# scalar walk. Callers who want to opt into SIMD can call
-# `parse_cpu_native[force_scalar=False]` directly. See
-# `pprint/.cursor/rules/plan.mdc` Phase 7 for the historical perf data
-# motivating this default.
 
 from ..value import Value
 from .stage1_scalar import (
@@ -95,6 +70,6 @@ def parse_cpu_native[force_scalar: Bool = True](s: String) raises -> Value:
         s: JSON input string.
 
     Returns:
-        Parsed Value, equivalent to `parse_simd(s)`.
+        Parsed Value.
     """
     return parse_two_pass[force_scalar=force_scalar](s)

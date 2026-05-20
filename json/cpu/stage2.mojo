@@ -52,8 +52,54 @@ def parse_with_index(input: String, index: StructuralIndex) raises -> Value:
     var positions = index.positions.copy()
     var pos_idx = 0
     var n = input.byte_length()
-    var value = _parse_value(input, positions, pos_idx, 0, n)
+    var bytes = input.as_bytes()
+
+    # Skip leading whitespace so primitives at the document root start
+    # at a known byte offset.
+    var doc_start = 0
+    while doc_start < n and _is_ws(bytes[doc_start]):
+        doc_start += 1
+
+    var value = _parse_value(input, positions, pos_idx, doc_start, n)
+
+    # Compute byte offset of the first byte AFTER the parsed value.
+    # Containers and strings advance `pos_idx` past their final
+    # structural (close-bracket / close-quote); primitives leave it
+    # untouched, so we walk bytes until we hit whitespace or EOF.
+    var consumed_end: Int
+    if pos_idx > 0:
+        consumed_end = Int(positions[pos_idx - 1]) + 1
+    else:
+        consumed_end = _primitive_end(bytes, doc_start, n)
+
+    # Trailing-content check: only whitespace may follow the value.
+    while consumed_end < n:
+        if not _is_ws(bytes[consumed_end]):
+            raise Error(
+                "Stage 2: trailing content after top-level JSON value at"
+                " offset "
+                + String(consumed_end)
+            )
+        consumed_end += 1
+
     return value^
+
+
+def _primitive_end(bytes: Span[UInt8, _], start: Int, n: Int) -> Int:
+    """Find the first byte after a top-level primitive (number / null /
+    true / false). Scans until whitespace, EOF, or a structural byte."""
+    var i = start
+    while i < n:
+        var c = bytes[i]
+        if (
+            _is_ws(c)
+            or c == UInt8(ord(","))
+            or c == UInt8(ord("}"))
+            or c == UInt8(ord("]"))
+        ):
+            break
+        i += 1
+    return i
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +191,12 @@ def _parse_string(
     if not has_escape:
         return Value(String(unsafe_from_utf8=bytes[start_idx:end_idx]))
 
+    # Validate every escape sequence before handing off to the
+    # unescaper: per JSON spec (RFC 8259 §7) only "\\\"\\/bfnrtu" are
+    # permitted after a backslash. The unescaper itself is non-raising
+    # and would silently keep the backslash for unknown escapes.
+    _validate_escapes(bytes, start_idx, end_idx)
+
     var n = input.byte_length()
     var bytes_list = List[UInt8](capacity=n)
     for j in range(n):
@@ -153,12 +205,60 @@ def _parse_string(
     return Value(String(unsafe_from_utf8=unescaped^))
 
 
+def _validate_escapes(bytes: Span[UInt8, _], start: Int, end: Int) raises:
+    var j = start
+    while j < end:
+        if bytes[j] != UInt8(ord("\\")):
+            j += 1
+            continue
+        if j + 1 >= end:
+            raise Error("Stage 2: trailing backslash in string")
+        var esc = bytes[j + 1]
+        if (
+            esc != UInt8(ord('"'))
+            and esc != UInt8(ord("\\"))
+            and esc != UInt8(ord("/"))
+            and esc != UInt8(ord("b"))
+            and esc != UInt8(ord("f"))
+            and esc != UInt8(ord("n"))
+            and esc != UInt8(ord("r"))
+            and esc != UInt8(ord("t"))
+            and esc != UInt8(ord("u"))
+        ):
+            raise Error(
+                "Stage 2: invalid escape sequence '\\"
+                + chr(Int(esc))
+                + "' at offset "
+                + String(j)
+            )
+        if esc == UInt8(ord("u")):
+            j += 6
+        else:
+            j += 2
+
+
 def _parse_number(input: String, start: Int, end: Int) raises -> Value:
     var bytes = input.as_bytes()
     var i = start
     var is_float = False
     if bytes[i] == UInt8(ord("-")):
         i += 1
+
+    # Per JSON spec (RFC 8259) numbers are `0` or `[1-9][0-9]*`. Reject
+    # leading zeros like `007` and `-00.5`.
+    if (
+        i < end
+        and bytes[i] == UInt8(ord("0"))
+        and i + 1 < end
+        and bytes[i + 1] >= UInt8(ord("0"))
+        and bytes[i + 1] <= UInt8(ord("9"))
+    ):
+        raise Error(
+            "Stage 2: leading zeros are not allowed in JSON numbers (offset "
+            + String(start)
+            + ")"
+        )
+
     while i < end:
         var c = bytes[i]
         if c >= UInt8(ord("0")) and c <= UInt8(ord("9")):
@@ -238,6 +338,7 @@ def _parse_array(
     var count = 0
     var depth = 0
     var last_top_comma_byte = -1
+    var prev_top_comma_byte = -1
     var k = open_idx + 1
     while k < close_idx:
         var off = Int(positions[k])
@@ -248,7 +349,34 @@ def _parse_array(
             depth -= 1
         elif b == UInt8(ord(",")) and depth == 0:
             count += 1
+            prev_top_comma_byte = last_top_comma_byte
             last_top_comma_byte = off
+            # Double-comma check: between two consecutive top-level
+            # commas there must be a non-ws value byte.
+            if prev_top_comma_byte >= 0:
+                var has_between = False
+                for j in range(prev_top_comma_byte + 1, off):
+                    if not _is_ws(bytes[j]):
+                        has_between = True
+                        break
+                if not has_between:
+                    raise Error(
+                        "Stage 2: empty element between commas in array"
+                        " at offset "
+                        + String(off)
+                    )
+            else:
+                # Between `[` and the first comma must also be non-ws.
+                var has_first = False
+                for j in range(open_offset + 1, off):
+                    if not _is_ws(bytes[j]):
+                        has_first = True
+                        break
+                if not has_first:
+                    raise Error(
+                        "Stage 2: leading comma in array at offset "
+                        + String(off)
+                    )
         elif b == UInt8(ord('"')):
             # Skip the matching closing quote that stage 1 emitted.
             k += 1
@@ -307,6 +435,11 @@ def _parse_object(
     var last_top_colon_byte = -1
     var last_top_comma_byte = -1
     var top_comma_count = 0
+    # Tracks whether we have seen a `:` at depth 0 since the last key
+    # was consumed. Reset on every top-level comma; cleared when a key
+    # is consumed; set when `:` is encountered. Used to detect
+    # `{"key" "value"}` (missing colon between key and value).
+    var saw_colon_after_key = True
     var k = open_idx + 1
     while k < close_idx:
         var off = Int(positions[k])
@@ -322,12 +455,14 @@ def _parse_object(
             continue
         if b == UInt8(ord(",")) and depth == 0:
             expect_key = True
+            saw_colon_after_key = True
             last_top_comma_byte = off
             top_comma_count += 1
             k += 1
             continue
         if b == UInt8(ord(":")) and depth == 0:
             last_top_colon_byte = off
+            saw_colon_after_key = True
             k += 1
             continue
         if b == UInt8(ord('"')):
@@ -346,8 +481,17 @@ def _parse_object(
                 )
                 keys.append(String(unsafe_from_utf8=key_bytes^))
                 expect_key = False
+                saw_colon_after_key = False
                 k += 2
                 continue
+            # Depth-0 string with `expect_key == False`. Must be the
+            # value half of a key:value pair, so a colon must have
+            # been seen since the last key.
+            if depth == 0 and not saw_colon_after_key:
+                raise Error(
+                    "Stage 2: missing ':' between key and value at offset "
+                    + String(off)
+                )
             k += 2
             continue
 
