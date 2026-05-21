@@ -19,8 +19,20 @@
 
 from std.collections import List
 from std.collections.dict import Dict
+from std.memory import ArcPointer
 
 from .value import Value, Null
+from ..document import (
+    Document,
+    TAPE_TAG_NULL,
+    TAPE_TAG_BOOL,
+    TAPE_TAG_INT,
+    TAPE_TAG_FLOAT,
+    TAPE_TAG_STRING,
+    TAPE_TAG_STRING_OWNED,
+    TAPE_TAG_ARRAY,
+    TAPE_TAG_OBJECT,
+)
 from ..unicode import unescape_json_string
 
 
@@ -128,9 +140,14 @@ struct OwnedValue(Copyable, Movable):
 def _value_to_owned(v: Value) raises -> OwnedValue:
     """Convert a `Value` to an `OwnedValue` tree.
 
-    For arrays and objects, this re-parses the raw JSON substring; for
-    primitives it copies the inline value. Phase C will short-circuit
-    this step when the source `Value` is already tape-backed.
+    Two fast paths:
+    * Tape-backed view (`v._is_view`): walk `Document.tape` directly
+      via `_view_to_owned`. No JSON serialization, no parsing.
+    * Legacy `_raw`: parse the raw substring with `_parse_owned_value`.
+
+    For primitives we always go through the inline value; the `is_*`
+    accessors already dispatch on `_is_view`, so this branch works
+    for both modes.
     """
     if v.is_null():
         return OwnedValue.make_null()
@@ -142,11 +159,59 @@ def _value_to_owned(v: Value) raises -> OwnedValue:
         return OwnedValue.make_float(v.float_value())
     if v.is_string():
         return OwnedValue.make_string(v.string_value())
-    if v.is_array():
-        return _parse_owned_value(v.raw_json())
-    if v.is_object():
+    if v.is_array() or v.is_object():
+        if v._is_view:
+            return _view_to_owned(v._doc, v._tape_idx)
         return _parse_owned_value(v.raw_json())
     raise Error("Unknown Value kind in _value_to_owned")
+
+
+def _view_to_owned(
+    doc: ArcPointer[Document], tape_idx: Int
+) raises -> OwnedValue:
+    """Walk a tape entry into a fresh `OwnedValue` tree.
+
+    This is the COW materialization path for tape-backed Values: no
+    raw JSON is produced or parsed, we just translate tape entries
+    one-for-one into `OwnedValue.make_*` constructors.
+
+    For arrays / objects we use `Document.get_count` and
+    `Document.get_child_start` to find children; KEY entries
+    (between OBJECT pairs) are read out of `key_pool` via
+    `Document.get_key`.
+    """
+    ref d = doc[]
+    var tag = d.get_tag(tape_idx)
+    if tag == TAPE_TAG_NULL:
+        return OwnedValue.make_null()
+    if tag == TAPE_TAG_BOOL:
+        return OwnedValue.make_bool(d.get_bool(tape_idx))
+    if tag == TAPE_TAG_INT:
+        return OwnedValue.make_int(d.get_int(tape_idx))
+    if tag == TAPE_TAG_FLOAT:
+        return OwnedValue.make_float(d.get_float(tape_idx))
+    if tag == TAPE_TAG_STRING or tag == TAPE_TAG_STRING_OWNED:
+        return OwnedValue.make_string(d.get_string(tape_idx))
+    if tag == TAPE_TAG_ARRAY:
+        var count = d.get_count(tape_idx)
+        var child_start = d.get_child_start(tape_idx)
+        var items = List[OwnedValue](capacity=count)
+        for i in range(count):
+            var child = _view_to_owned(doc, child_start + i)
+            items.append(child^)
+        return OwnedValue.make_array(items^)
+    if tag == TAPE_TAG_OBJECT:
+        var pair_count = d.get_count(tape_idx)
+        var child_start = d.get_child_start(tape_idx)
+        var keys = List[String](capacity=pair_count)
+        var values = List[OwnedValue](capacity=pair_count)
+        for i in range(pair_count):
+            var key = d.get_key(child_start + 2 * i)
+            keys.append(key^)
+            var val = _view_to_owned(doc, child_start + 2 * i + 1)
+            values.append(val^)
+        return OwnedValue.make_object(keys^, values^)
+    raise Error("Unknown tape tag in _view_to_owned: " + String(Int(tag)))
 
 
 def _parse_owned_value(json_str: String) raises -> OwnedValue:
