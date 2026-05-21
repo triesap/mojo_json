@@ -30,8 +30,8 @@ v0.2 changes worth knowing:
   with `-D JSON_GPU_ALLOW_APPLE_FALLBACK=1` to keep the v0.1 silent
   CPU fallback.
 - Typed NDJSON file load: `load[format='ndjson'](path) -> List[Value]`.
-- The deprecated `loads_with_config` alias was removed -- use the
-  two-arg `loads(s, config)` overload.
+- Configured parsing / serialisation use the two-arg overloads:
+  `loads(s, config)` and `dumps(v, config)`.
 """
 
 # Core API.

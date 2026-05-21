@@ -505,9 +505,6 @@ def load[streaming: Bool](path: String) raises -> StreamingParser:
     return StreamingParser(path)
 
 
-# loads_with_config was removed in v0.2-E. Use `loads(s, config)` instead --
-# the dual-arity overload renders the deprecated alias redundant.
-
 from .config import ParserConfig
 from .lazy import LazyValue
 from .streaming import StreamingParser

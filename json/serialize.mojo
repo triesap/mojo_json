@@ -332,41 +332,6 @@ def dump[
     f.write(dumps[format="ndjson"](values))
 
 
-# Backwards compatibility alias (deprecated, use dumps(v, config) instead)
-def dumps_with_config(v: Value, config: SerializerConfig) -> String:
-    """Serialize a Value with custom configuration.
-
-    Args:
-        v: Value to serialize.
-        config: Serializer configuration.
-
-    Returns:
-        JSON string representation.
-
-    Example:
-        var config = SerializerConfig(sort_keys=True, indent="  ")
-        var json = dumps_with_config(value, config).
-    """
-    var result: String
-
-    if config.indent == "":
-        result = to_string(v)
-    else:
-        result = _to_string_pretty(v, config.indent, "")
-
-    # Apply additional options
-    if config.escape_unicode:
-        result = _escape_unicode_chars(result)
-
-    if config.escape_forward_slash:
-        result = _escape_forward_slashes(result)
-
-    if config.sort_keys and (v.is_object() or v.is_array()):
-        result = _sort_object_keys(result)
-
-    return result^
-
-
 def _escape_unicode_chars(s: String) -> String:
     """Escape non-ASCII characters as \\uXXXX."""
     var result = String()

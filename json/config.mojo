@@ -57,7 +57,7 @@ struct SerializerConfig:
 
     Example:
         var config = SerializerConfig(sort_keys=True, indent="  ")
-        var json = dumps_with_config(value, config).
+        var json = dumps(value, config).
     """
 
     var indent: String
