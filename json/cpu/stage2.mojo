@@ -603,6 +603,33 @@ def parse_two_pass[force_scalar: Bool = False](input: String) raises -> Value:
         return parse_with_index(input, index)
 
 
+def parse_two_pass_tape[
+    force_scalar: Bool = False
+](var input: String) raises -> Document:
+    """End-to-end stage 1 + stage 2 parse that emits a `Document`.
+
+    Parameters:
+        force_scalar: When False (default), use SIMD stage 1; same
+            switch as `parse_two_pass`.
+
+    Args:
+        input: JSON input. The returned `Document` owns this string,
+            so its bytes can back zero-copy string slices on the tape.
+
+    Returns:
+        Owned `Document` with the root at `Document.root()`.
+    """
+    from .stage1_scalar import parse_structural_scalar
+    from .stage1 import parse_structural_simd
+
+    comptime if force_scalar:
+        var index = parse_structural_scalar(input)
+        return parse_into_document(input^, index)
+    else:
+        var index = parse_structural_simd(input)
+        return parse_into_document(input^, index)
+
+
 # ---------------------------------------------------------------------------
 # Tape-emitting walker (Phase 2a).
 #

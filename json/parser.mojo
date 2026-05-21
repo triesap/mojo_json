@@ -11,7 +11,7 @@ from .cpu import SimdjsonFFI, SIMDJSON_TYPE_NULL, SIMDJSON_TYPE_BOOL
 from .cpu import SIMDJSON_TYPE_INT64, SIMDJSON_TYPE_UINT64
 from .cpu import SIMDJSON_TYPE_DOUBLE, SIMDJSON_TYPE_STRING
 from .cpu import SIMDJSON_TYPE_ARRAY, SIMDJSON_TYPE_OBJECT
-from .cpu import parse_cpu_native
+from .cpu import parse_cpu_native, parse_cpu_native_tape
 from .types import JSONInput, JSONResult
 from .gpu import parse_json_gpu, parse_gpu_to_value
 
@@ -70,8 +70,15 @@ def _parse_cpu_mojo(s: String) raises -> Value:
     The stage 1 default is SIMD (1.5x to 2.2x faster than the scalar
     walker on the benchmark corpora). Differential testing routes
     through `cpu.parse_cpu_native[force_scalar=True]`.
+
+    Build with `-D JSON_USE_TAPE_VALUE=1` to route through the
+    tape-backed Value view (Phase 2c). The flag will become the
+    default once the test suite is fully green on the tape path.
     """
-    return parse_cpu_native(s)
+    comptime if is_defined["JSON_USE_TAPE_VALUE"]():
+        return parse_cpu_native_tape(s)
+    else:
+        return parse_cpu_native(s)
 
 
 def _parse_cpu[backend: StaticString = "simdjson"](s: String) raises -> Value:

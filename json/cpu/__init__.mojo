@@ -50,13 +50,16 @@ from .simdjson_ffi import (
     SIMDJSON_TYPE_OBJECT,
 )
 
+from std.memory import ArcPointer
 from ..value import Value
+from ..value.value import make_view_value
+from ..document import Document
 from .stage1_scalar import (
     parse_structural_scalar,
     StructuralIndex,
 )
 from .stage1 import parse_structural_simd
-from .stage2 import parse_with_index, parse_two_pass
+from .stage2 import parse_with_index, parse_two_pass, parse_two_pass_tape
 
 
 def parse_cpu_native[force_scalar: Bool = False](s: String) raises -> Value:
@@ -75,3 +78,30 @@ def parse_cpu_native[force_scalar: Bool = False](s: String) raises -> Value:
         Parsed Value.
     """
     return parse_two_pass[force_scalar=force_scalar](s)
+
+
+def parse_cpu_native_tape[
+    force_scalar: Bool = False
+](var s: String) raises -> Value:
+    """Two-pass CPU parser that returns a tape-backed Value view.
+
+    Same parsing pipeline as `parse_cpu_native`, but the output value
+    is a view into a freshly built `Document`. Reads (`is_*`,
+    `*_value`, `array_count`, `__getitem__`, etc.) hit the tape
+    directly; mutations materialise back into the legacy
+    representation transparently.
+
+    Parameters:
+        force_scalar: SIMD vs scalar stage 1 (default SIMD).
+
+    Args:
+        s: JSON input string. The returned `Value`'s document owns
+            this string.
+
+    Returns:
+        Tape-backed `Value` view of the document root.
+    """
+    var doc = parse_two_pass_tape[force_scalar=force_scalar](s^)
+    var root_idx = doc.root()
+    var arc = ArcPointer[Document](doc^)
+    return make_view_value(arc, root_idx)

@@ -6,7 +6,7 @@
 # input. As Phase C reworks the native parser into a two-pass tape
 # build, this test guards against drift between the two implementations.
 
-from std.testing import assert_equal, assert_true, TestSuite
+from std.testing import assert_true, TestSuite
 
 from json import loads, dumps, Value
 
@@ -69,7 +69,11 @@ def _values_equal(a: Value, b: Value) raises -> Bool:
 
 
 def _check_equivalence(s: String) raises:
-    """Both backends must yield equal Values and equal dumps for `s`."""
+    """Both backends must yield structurally equal Values and dumps that
+    round-trip to structurally equal Values. The legacy CPU path and the
+    simdjson FFI both echo input whitespace through `raw_json()`, but the
+    tape-backed CPU path emits canonical compact JSON; comparing dumps
+    byte-for-byte over-specifies behaviour. Re-parsing closes the gap."""
     var native = loads[target="cpu"](s)
     var ffi = loads[target="cpu-simdjson"](s)
 
@@ -80,7 +84,20 @@ def _check_equivalence(s: String) raises:
 
     var dn = dumps(native)
     var df = dumps(ffi)
-    assert_equal(dn, df, "Backends produced different dumps for: " + s)
+    var rn = loads[target="cpu"](dn)
+    var rf = loads[target="cpu"](df)
+    assert_true(
+        _values_equal(rn, rf),
+        (
+            "Backends produced semantically different dumps for: "
+            + s
+            + " (native="
+            + dn
+            + " ffi="
+            + df
+            + ")"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
