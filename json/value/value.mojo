@@ -94,8 +94,16 @@ struct Value(Copyable, Movable, Writable):
     var _doc: ArcPointer[Document]
     var _tape_idx: Int
 
-    def __init__(out self, null: Null):
-        self._type = 0
+    def __init__(out self, doc: ArcPointer[Document], tape_idx: Int):
+        """Primary constructor: a tape-backed view over `doc[].tape[tape_idx]`.
+
+        All other public constructors delegate here by building a
+        single-entry `Document` and wrapping it in an `ArcPointer`. The
+        legacy `_type` / `_bool` / ... fields are mirrored from the
+        tape tag so any v0.1 code that still peeks at `_type` directly
+        stays honest while the dual-representation branches are still
+        in tree (they collapse in commit 4 of this plan).
+        """
         self._bool = False
         self._int = 0
         self._float = 0.0
@@ -103,87 +111,61 @@ struct Value(Copyable, Movable, Writable):
         self._raw = String()
         self._keys = List[String]()
         self._count = 0
-        self._is_view = False
-        self._doc = ArcPointer(Document())
-        self._tape_idx = -1
+        self._is_view = True
+        self._doc = doc
+        self._tape_idx = tape_idx
+        var tag = self._doc[].get_tag(tape_idx)
+        if tag == TAPE_TAG_NULL:
+            self._type = 0
+        elif tag == TAPE_TAG_BOOL:
+            self._type = 1
+        elif tag == TAPE_TAG_INT:
+            self._type = 2
+        elif tag == TAPE_TAG_FLOAT:
+            self._type = 3
+        elif tag == TAPE_TAG_STRING or tag == TAPE_TAG_STRING_OWNED:
+            self._type = 4
+        elif tag == TAPE_TAG_ARRAY:
+            self._type = 5
+        elif tag == TAPE_TAG_OBJECT:
+            self._type = 6
+        else:
+            self._type = 0
+
+    def __init__(out self, null: Null):
+        var d = Document()
+        _ = d.append_null()
+        self = Self(ArcPointer[Document](d^), 0)
 
     def __init__(out self, none: NoneType):
-        self._type = 0
-        self._bool = False
-        self._int = 0
-        self._float = 0.0
-        self._string = String()
-        self._raw = String()
-        self._keys = List[String]()
-        self._count = 0
-        self._is_view = False
-        self._doc = ArcPointer(Document())
-        self._tape_idx = -1
+        var d = Document()
+        _ = d.append_null()
+        self = Self(ArcPointer[Document](d^), 0)
 
     def __init__(out self, b: Bool):
-        self._type = 1
-        self._bool = b
-        self._int = 0
-        self._float = 0.0
-        self._string = String()
-        self._raw = String()
-        self._keys = List[String]()
-        self._count = 0
-        self._is_view = False
-        self._doc = ArcPointer(Document())
-        self._tape_idx = -1
+        var d = Document()
+        _ = d.append_bool(b)
+        self = Self(ArcPointer[Document](d^), 0)
 
     def __init__(out self, i: Int):
-        self._type = 2
-        self._bool = False
-        self._int = Int64(i)
-        self._float = 0.0
-        self._string = String()
-        self._raw = String()
-        self._keys = List[String]()
-        self._count = 0
-        self._is_view = False
-        self._doc = ArcPointer(Document())
-        self._tape_idx = -1
+        var d = Document()
+        _ = d.append_int(Int64(i))
+        self = Self(ArcPointer[Document](d^), 0)
 
     def __init__(out self, i: Int64):
-        self._type = 2
-        self._bool = False
-        self._int = i
-        self._float = 0.0
-        self._string = String()
-        self._raw = String()
-        self._keys = List[String]()
-        self._count = 0
-        self._is_view = False
-        self._doc = ArcPointer(Document())
-        self._tape_idx = -1
+        var d = Document()
+        _ = d.append_int(i)
+        self = Self(ArcPointer[Document](d^), 0)
 
     def __init__(out self, f: Float64):
-        self._type = 3
-        self._bool = False
-        self._int = 0
-        self._float = f
-        self._string = String()
-        self._raw = String()
-        self._keys = List[String]()
-        self._count = 0
-        self._is_view = False
-        self._doc = ArcPointer(Document())
-        self._tape_idx = -1
+        var d = Document()
+        _ = d.append_float(f)
+        self = Self(ArcPointer[Document](d^), 0)
 
-    def __init__(out self, s: String):
-        self._type = 4
-        self._bool = False
-        self._int = 0
-        self._float = 0.0
-        self._string = s
-        self._raw = String()
-        self._keys = List[String]()
-        self._count = 0
-        self._is_view = False
-        self._doc = ArcPointer(Document())
-        self._tape_idx = -1
+    def __init__(out self, var s: String):
+        var d = Document()
+        _ = d.append_string_owned(s^)
+        self = Self(ArcPointer[Document](d^), 0)
 
     def copy(self) -> Self:
         """Create a copy of this Value.
@@ -725,8 +707,14 @@ struct Value(Copyable, Movable, Writable):
 
 
 def make_array_value(raw: String, count: Int) -> Value:
-    """Create an array Value from raw JSON."""
+    """Create a legacy (lazy / raw-substring) array Value.
+
+    Slated for removal in commit 3 of the "Remove lazy v0.1
+    representation from `Value`" plan; only `_navigate_pointer` and
+    the v0.1 lazy CPU parser still call this.
+    """
     var v = Value(Null())
+    v._is_view = False
     v._type = 5
     v._raw = raw
     v._count = count
@@ -734,8 +722,14 @@ def make_array_value(raw: String, count: Int) -> Value:
 
 
 def make_object_value(raw: String, var keys: List[String]) -> Value:
-    """Create an object Value from raw JSON and keys."""
+    """Create a legacy (lazy / raw-substring) object Value.
+
+    Slated for removal in commit 3 of the "Remove lazy v0.1
+    representation from `Value`" plan; only `_navigate_pointer` and
+    the v0.1 lazy CPU parser still call this.
+    """
     var v = Value(Null())
+    v._is_view = False
     v._type = 6
     v._raw = raw
     v._count = len(keys)
@@ -942,45 +936,17 @@ def _navigate_pointer(v: Value, tokens: List[String]) raises -> Value:
 def make_view_value(doc: ArcPointer[Document], tape_idx: Int) -> Value:
     """Build a tape-backed `Value` view over `doc[].tape[tape_idx]`.
 
-    The view shares ownership of `doc` -- copying the resulting Value
-    (including child views from `array_items` / `object_items`) only
-    bumps an atomic refcount. Phase 2c routes `loads(target='cpu')`
-    through this factory.
+    Thin wrapper around the `Value(doc, tape_idx)` primary
+    constructor. Kept as a free function so callers don't need to
+    spell out the type, and so the construction site reads as
+    "make a view" rather than "build a Value".
     """
-    var v = Value(Null())
-    v._is_view = True
-    v._doc = doc
-    v._tape_idx = tape_idx
-    # Reflect the tape tag in `_type` so any v0.1 code that still
-    # peeks at `_type` directly stays honest. View-mode dispatch
-    # always wins, but accessors that don't dispatch (e.g. raw
-    # struct field reads in user code) still see the right kind.
-    var tag = doc[].get_tag(tape_idx)
-    if tag == TAPE_TAG_NULL:
-        v._type = 0
-    elif tag == TAPE_TAG_BOOL:
-        v._type = 1
-    elif tag == TAPE_TAG_INT:
-        v._type = 2
-    elif tag == TAPE_TAG_FLOAT:
-        v._type = 3
-    elif tag == TAPE_TAG_STRING or tag == TAPE_TAG_STRING_OWNED:
-        v._type = 4
-    elif tag == TAPE_TAG_ARRAY:
-        v._type = 5
-    elif tag == TAPE_TAG_OBJECT:
-        v._type = 6
-    return v^
+    return Value(doc, tape_idx)
 
 
 def _make_view_child(doc: ArcPointer[Document], tape_idx: Int) -> Value:
-    """Build a child view by sharing the parent's `doc`.
-
-    Identical to `make_view_value` but kept private so the factory
-    function can stay the only public entry point for constructing a
-    view.
-    """
-    return make_view_value(doc, tape_idx)
+    """Build a child view by sharing the parent's `doc`."""
+    return Value(doc, tape_idx)
 
 
 def _view_to_json(v: Value) -> String:
