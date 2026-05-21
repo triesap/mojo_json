@@ -147,6 +147,11 @@ def _tokenize_jsonpath(path: String) raises -> List[JSONPathToken]:
                     elif path_bytes[i] == UInt8(ord("]")):
                         depth -= 1
                     i += 1
+                if depth != 0:
+                    raise Error("Unclosed JSONPath filter '[?...': " + path)
+                # `i` points just past the closing ']'. The expression is
+                # the slice between `start` and the bracket, i.e. `i - 1`.
+                # Guarded by the depth check above so `i - 1 >= start`.
                 var expr = String(
                     String(unsafe_from_utf8=path.as_bytes()[start : i - 1])
                 )

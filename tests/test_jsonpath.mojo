@@ -137,6 +137,26 @@ def test_jsonpath_one_no_match() raises:
     assert_true(caught)
 
 
+def test_jsonpath_unclosed_filter_rejected() raises:
+    """Regression: unclosed ``[?`` previously underflowed the slice and
+    crashed the tokenizer (caught by fuzz_jsonpath). Now it must raise
+    a regular ``Error``."""
+    var doc = loads('{"x":1}')
+    var paths = [
+        String("$[?"),
+        String("$[?@.price<"),
+        String("$..book[?@.price<"),
+        String("$.store[?"),
+    ]
+    for i in range(len(paths)):
+        var caught = False
+        try:
+            _ = jsonpath_query(doc, paths[i].copy())
+        except:
+            caught = True
+        assert_true(caught, "expected unclosed filter to raise: " + paths[i])
+
+
 def main() raises:
     print("=" * 60)
     print("test_jsonpath.mojo - JSONPath Tests")
