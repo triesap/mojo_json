@@ -110,21 +110,40 @@ json = { git = "https://github.com/ehsanmok/json.git", branch = "main" }
 
 ### CPU (Apple Silicon, M-series)
 
-`pixi run bench-cpu <file>` runs the C++ `simdjson` reference and the
-three Mojo CPU paths back-to-back.
+`pixi run bench-cpu <file>` runs simdjson C++ first, then the three
+Mojo CPU paths under both `parse + peek` and `parse + traverse-every-value`
+workloads.
 
-| File | Size | simdjson C++ | Mojo simd (default) | Mojo scalar | Mojo tape (eager) |
+**Parse + peek** (lazy paths short-circuit; tape pays full materialisation cost):
+
+| File | Size | simdjson C++ | simd (lazy) | scalar (lazy) | tape (eager) |
 |---|---|---|---|---|---|
 | `twitter.json` | 617 KB | 2.66 GB/s | **1.18 GB/s** | 0.60 GB/s | 0.23 GB/s |
 | `citm_catalog.json` | 1.7 MB | 3.13 GB/s | **1.33 GB/s** | 0.62 GB/s | 0.23 GB/s |
 | `twitter_large_record.json` | 804 MB | 1.47 GB/s | **0.73 GB/s** | 0.51 GB/s | 0.15 GB/s |
 
-The default `loads(target='cpu')` is **~50 % of native simdjson** in
-pure Mojo with zero FFI. The `tape` row is the eager
-`-D JSON_USE_TAPE_VALUE=1` path -- it's slower under bench's
-`parse + access top-level` workload because it materialises the whole
-`Document` upfront, but free for code that traverses everything
-afterwards.
+**Parse + traverse every value** (the realistic workload):
+
+| File | simd_traverse (lazy) | **tape_traverse (eager)** |
+|---|---|---|
+| `twitter.json` | 142.9 ms | **4.17 ms (34x faster)** |
+| `citm_catalog.json` | **701 ms, but buggy ❌** | **11.38 ms, correct ✅ (62x faster)** |
+
+The lazy path raises `Key not found in JSON object` mid-walk on
+`citm_catalog` -- `object_items()` re-scans the raw substring for
+every remembered key, and the second scan can disagree with the first
+on documents with duplicate keys or non-trivial escapes. **Tape is
+the only path that walks `citm_catalog` correctly**, and it's 30-60×
+faster than the (buggy) lazy walk on the same input.
+
+The lazy paths still beat tape on `parse + peek` because they don't
+decode children -- they store array/object bodies as raw substrings
+and rescan on access. That makes them cheap when you ignore the
+parsed result and pathologically slow / incorrect when you don't.
+Tape (`-D JSON_USE_TAPE_VALUE=1`) is the v0.2 design's answer:
+typed tape entries, zero-copy strings, one DOM representation shared
+with the GPU pipeline, and correct nested mutation. It's the future
+default; the flag is the staged rollout.
 
 ```bash
 # Download large dataset first (required for meaningful GPU benchmarks).

@@ -60,25 +60,38 @@ cuJSON commit `2ac7d3dcd7ad1ff64ebdb14022bf94c59b3b4953`.
 
 ### CPU: Mojo native (default) vs simdjson C++ (Apple Silicon, M-series)
 
-`pixi run -e dev bench-cpu <file>` runs the C++ `simdjson` reference
-binary first, then the three Mojo CPU paths (`scalar`, `simd`, `tape`)
-in one `std.benchmark.Bench` table.
+`pixi run -e dev bench-cpu <file>` runs simdjson C++, then the three
+Mojo CPU paths (`scalar`, `simd`, `tape`) under two access patterns:
+`parse + peek the root` and `parse + walk every value`.
 
-| Corpus | Size | simdjson C++ | Mojo simd (default) | Mojo scalar | Mojo tape (eager) |
+**Parse + peek** -- the lazy paths short-circuit because they don't
+decode children; tape pays full materialisation cost:
+
+| Corpus | Size | simdjson C++ | Mojo simd | Mojo scalar | Mojo tape |
 |---|---|---|---|---|---|
 | `twitter.json` | 617 KB | 2.66 GB/s | **1.18 GB/s** | 0.60 GB/s | 0.23 GB/s |
 | `citm_catalog.json` | 1.7 MB | 3.13 GB/s | **1.33 GB/s** | 0.62 GB/s | 0.23 GB/s |
 | `twitter_large_record.json` | 804 MB | 1.47 GB/s | **0.73 GB/s** | 0.51 GB/s | 0.15 GB/s |
 
-The bench measures `parse + access top-level`, which is what `loads`
-hands the caller. The lazy `simd` / `scalar` paths only deserialise
-what is inspected, while `tape` (`-D JSON_USE_TAPE_VALUE=1`)
-materialises the whole `Document` upfront -- it pays for itself when
-the program then iterates the entire tree.
+**Parse + traverse every value** -- the realistic workload for any
+consumer that actually reads the document:
 
-Headline: pure-Mojo `simd` runs at **~50 % of native simdjson** on
-this hardware with zero FFI, and is **~2× faster than the simdjson
-FFI shim** (which carries the marshalling tax).
+| Corpus | simd_traverse (lazy) | **tape_traverse (eager)** |
+|---|---|---|
+| `twitter.json` | 142.9 ms | **4.17 ms** (34x faster) |
+| `citm_catalog.json` | **701 ms, but buggy ❌** | **11.38 ms, correct ✅** (62x faster) |
+
+The lazy path raises `Key not found` mid-walk on `citm_catalog`
+because `object_items()` re-scans the raw substring per remembered
+key; that second scan can disagree with the first on documents with
+duplicate keys or non-trivial escapes. Tape is the only path that
+walks `citm_catalog` correctly **and** it's 30-60x faster than the
+(buggy) lazy walk on the same input.
+
+Headline: under peek-only, pure-Mojo `simd` runs at ~50% of native
+simdjson with zero FFI; under realistic traversal, the only sensible
+choice is `tape` (the v0.2 design's answer to the lazy path's
+silent-bug surface).
 
 ## Important: GPU Benchmarks Require Large Files
 

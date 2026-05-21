@@ -74,17 +74,28 @@ bytes for structure.
 
 **Performance (Apple Silicon, M-series; `pixi run -e dev bench-cpu`):**
 
-| Corpus | Size | Scalar | SIMD | Tape (`-D JSON_USE_TAPE_VALUE=1`) | simdjson C++ |
-|---|---|---|---|---|---|
-| `twitter.json` | 617 KB | 0.60 GB/s | **1.18 GB/s** | 0.23 GB/s | 2.66 GB/s |
-| `citm_catalog.json` | 1.7 MB | 0.62 GB/s | **1.33 GB/s** | 0.23 GB/s | 3.13 GB/s |
-| `twitter_large_record.json` | 804 MB | 0.51 GB/s | **0.73 GB/s** | 0.15 GB/s | 1.47 GB/s |
+The bench reports both `parse + peek` and `parse + traverse-every-value`.
+The peek workload is what the lazy `Value` was optimised for; the
+traverse workload is what nearly all real consumers actually do.
 
-The bench measures `parse + access top-level`. The lazy
-`simd`/`scalar` paths only deserialise what the caller actually
-inspects, while the eager `tape` path materialises the whole
-`Document` -- so under this workload `tape` looks slower, but it pays
-for itself when the program then iterates every value.
+| Corpus | Size | simd peek | tape peek | simd traverse | tape traverse | simdjson C++ |
+|---|---|---|---|---|---|---|
+| `twitter.json` | 617 KB | **1.18 GB/s** | 0.23 GB/s | 142.9 ms | **4.17 ms** | 2.66 GB/s |
+| `citm_catalog.json` | 1.7 MB | **1.33 GB/s** | 0.23 GB/s | **701 ms ❌** | **11.38 ms ✅** | 3.13 GB/s |
+| `twitter_large_record.json` | 804 MB | **0.73 GB/s** | 0.15 GB/s | n/a | n/a | 1.47 GB/s |
+
+The `citm_catalog` traverse row is the punchline:
+`simd_traverse` raises `Key not found` mid-walk because the lazy
+`object_items()` re-scans the raw substring for each remembered key,
+and that second scan can disagree with the first on documents with
+duplicate keys or non-trivial escapes. The tape path doesn't have
+this problem because every value is a stable tape index. Tape is
+30-60x faster than the lazy walk *and* the only path that walks
+`citm_catalog` correctly.
+
+The peek-only rows still measure something useful -- pure
+parse-validate cost with no DOM consumption -- but the traversal rows
+are the honest CPU comparison.
 
 **Usage:**
 ```mojo
