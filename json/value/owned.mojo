@@ -33,7 +33,7 @@ from ..document import (
     TAPE_TAG_ARRAY,
     TAPE_TAG_OBJECT,
 )
-from ..unicode import unescape_json_string
+from ..unicode import unescape_json_string, unescape_json_string_span
 
 
 # ---------------------------------------------------------------------------
@@ -279,10 +279,7 @@ def _parse_owned_at(
             return OwnedValue.make_string(
                 String(unsafe_from_utf8=bytes[start_idx:end_idx])
             )
-        var bytes_list = List[UInt8](capacity=n)
-        for j in range(n):
-            bytes_list.append(bytes[j])
-        var unescaped = unescape_json_string(bytes_list, start_idx, end_idx)
+        var unescaped = unescape_json_string_span(bytes, start_idx, end_idx)
         return OwnedValue.make_string(String(unsafe_from_utf8=unescaped^))
 
     if c == UInt8(ord("-")) or (c >= UInt8(ord("0")) and c <= UInt8(ord("9"))):

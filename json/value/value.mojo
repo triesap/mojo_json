@@ -44,7 +44,7 @@ from ..document import (
     TAPE_TAG_OBJECT,
     TAPE_TAG_KEY,
 )
-from ..unicode import unescape_json_string
+from ..unicode import unescape_json_string, unescape_json_string_span
 
 
 struct Null(Writable):
@@ -845,10 +845,7 @@ def _parse_json_value_to_value(json_str: String) raises -> Value:
                 String(String(unsafe_from_utf8=s.as_bytes()[start_idx:end_idx]))
             )
 
-        var bytes_list = List[UInt8](capacity=n)
-        for j in range(n):
-            bytes_list.append(s_bytes[j])
-        var unescaped = unescape_json_string(bytes_list, start_idx, end_idx)
+        var unescaped = unescape_json_string_span(s_bytes, start_idx, end_idx)
         return Value(String(unsafe_from_utf8=unescaped^))
 
     if first_char == UInt8(ord("-")) or (

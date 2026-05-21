@@ -183,12 +183,9 @@ def _parse_string_value(s: String, start: Int) raises -> Value:
     if not has_escapes:
         return Value(String(String(unsafe_from_utf8=s.as_bytes()[i:end_idx])))
 
-    # Slow path: handle escapes including \uXXXX
-
-    var bytes_list = List[UInt8](capacity=n)
-    for j in range(n):
-        bytes_list.append(data[j])
-    var unescaped = unescape_json_string(bytes_list, i, end_idx)
+    # Slow path: handle escapes including \uXXXX. Span-based so the
+    # entire input doesn't get copied into a List[UInt8] per string.
+    var unescaped = unescape_json_string_span(data, i, end_idx)
     return Value(String(unsafe_from_utf8=unescaped^))
 
 
@@ -515,6 +512,6 @@ from .config import ParserConfig
 from .lazy import LazyValue
 from .streaming import StreamingParser
 from .errors import json_parse_error
-from .unicode import unescape_json_string
+from .unicode import unescape_json_string, unescape_json_string_span
 from .config import preprocess_json
 from .ndjson import _split_lines, _is_whitespace_only

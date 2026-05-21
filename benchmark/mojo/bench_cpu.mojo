@@ -23,6 +23,7 @@ from std.benchmark import (
 from std.pathlib import Path
 from std.sys import argv
 from json.cpu.stage2 import parse_two_pass
+from json.cpu import parse_cpu_native_tape
 
 
 def main() raises:
@@ -75,9 +76,23 @@ def main() raises:
 
         b.iter[call_fn]()
 
+    @parameter
+    @always_inline
+    def bench_tape(mut b: Bencher) raises capturing:
+        @parameter
+        @always_inline
+        def call_fn() raises:
+            # Tape-backed Value view (Phase 2 + 3): SIMD stage 1 +
+            # tape-emitting stage 2 + zero-copy clean strings.
+            var v = parse_cpu_native_tape(json_str.copy())
+            _ = v.is_object()
+
+        b.iter[call_fn]()
+
     var measures = List[ThroughputMeasure]()
     measures.append(ThroughputMeasure(BenchMetric.bytes, file_size))
     bench.bench_function[bench_scalar](BenchId("json_cpu", "scalar"), measures)
     bench.bench_function[bench_simd](BenchId("json_cpu", "simd"), measures)
+    bench.bench_function[bench_tape](BenchId("json_cpu", "tape"), measures)
 
     print(bench)

@@ -40,6 +40,25 @@ def parse_unicode_escape(data: List[UInt8], start: Int) -> Int:
     return result
 
 
+def parse_unicode_escape_span(data: Span[UInt8, _], start: Int) -> Int:
+    """`parse_unicode_escape` overload that accepts a borrowed byte span.
+
+    Used by the tape stage 2 string emitter so it doesn't have to copy
+    the whole input into a `List[UInt8]` per string with escapes.
+    """
+    if start + 4 > len(data):
+        return -1
+
+    var result = 0
+    for i in range(4):
+        var digit = hex_digit_value(data[start + i])
+        if digit < 0:
+            return -1
+        result = result * 16 + digit
+
+    return result
+
+
 def is_high_surrogate(code_point: Int) -> Bool:
     """Check if code point is a high surrogate (U+D800 - U+DBFF)."""
     return code_point >= 0xD800 and code_point <= 0xDBFF
@@ -88,6 +107,90 @@ def encode_utf8(code_point: Int, mut bytes: List[UInt8]):
         bytes.append(UInt8(0x80 | ((code_point >> 12) & 0x3F)))
         bytes.append(UInt8(0x80 | ((code_point >> 6) & 0x3F)))
         bytes.append(UInt8(0x80 | (code_point & 0x3F)))
+
+
+def unescape_json_string_span(
+    data: Span[UInt8, _], start: Int, end: Int
+) -> List[UInt8]:
+    """`unescape_json_string` overload that accepts a borrowed byte span.
+
+    Avoids the O(input_size) copy from `List[UInt8]` per string when
+    only a tiny slice between the quotes contains escapes. Same
+    behaviour as the `List[UInt8]` overload below; defined inline so
+    we don't need a generic dispatch helper.
+    """
+    var result = List[UInt8](capacity=end - start)
+    var i = start
+
+    while i < end:
+        var c = data[i]
+
+        if c == UInt8(ord("\\")) and i + 1 < end:
+            var next = data[i + 1]
+
+            if next == UInt8(ord("n")):
+                result.append(0x0A)
+                i += 2
+            elif next == UInt8(ord("t")):
+                result.append(0x09)
+                i += 2
+            elif next == UInt8(ord("r")):
+                result.append(0x0D)
+                i += 2
+            elif next == UInt8(ord("\\")):
+                result.append(0x5C)
+                i += 2
+            elif next == UInt8(ord('"')):
+                result.append(0x22)
+                i += 2
+            elif next == UInt8(ord("/")):
+                result.append(0x2F)
+                i += 2
+            elif next == UInt8(ord("b")):
+                result.append(0x08)
+                i += 2
+            elif next == UInt8(ord("f")):
+                result.append(0x0C)
+                i += 2
+            elif next == UInt8(ord("u")):
+                var code_point = parse_unicode_escape_span(data, i + 2)
+                if code_point < 0:
+                    result.append(c)
+                    i += 1
+                    continue
+
+                if is_high_surrogate(code_point):
+                    if (
+                        i + 10 < end
+                        and data[i + 6] == UInt8(ord("\\"))
+                        and data[i + 7] == UInt8(ord("u"))
+                    ):
+                        var low = parse_unicode_escape_span(data, i + 8)
+                        if is_low_surrogate(low):
+                            code_point = decode_surrogate_pair(code_point, low)
+                            i += 12
+                            encode_utf8(code_point, result)
+                            continue
+                    result.append(0xEF)
+                    result.append(0xBF)
+                    result.append(0xBD)
+                    i += 6
+                elif is_low_surrogate(code_point):
+                    result.append(0xEF)
+                    result.append(0xBF)
+                    result.append(0xBD)
+                    i += 6
+                else:
+                    encode_utf8(code_point, result)
+                    i += 6
+            else:
+                result.append(c)
+                i += 1
+        else:
+            result.append(c)
+            i += 1
+
+    return result^
 
 
 def unescape_json_string(

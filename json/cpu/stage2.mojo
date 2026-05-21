@@ -29,7 +29,7 @@ from ..value import (
     make_array_value,
     make_object_value,
 )
-from ..unicode import unescape_json_string
+from ..unicode import unescape_json_string, unescape_json_string_span
 from ..document import (
     Document,
     pack_tape_entry,
@@ -215,11 +215,10 @@ def _parse_string(
     # and would silently keep the backslash for unknown escapes.
     _validate_escapes(bytes, start_idx, end_idx)
 
-    var n = input.byte_length()
-    var bytes_list = List[UInt8](capacity=n)
-    for j in range(n):
-        bytes_list.append(bytes[j])
-    var unescaped = unescape_json_string(bytes_list, start_idx, end_idx)
+    # Span-based unescape: we only need to read between the quotes,
+    # so binding `bytes` (a `Span[UInt8, _]` over the whole input)
+    # avoids copying the input into a `List[UInt8]` per string.
+    var unescaped = unescape_json_string_span(bytes, start_idx, end_idx)
     return Value(String(unsafe_from_utf8=unescaped^))
 
 
@@ -775,11 +774,11 @@ def _emit_string_to_doc(
 
     _validate_escapes(bytes, start_idx, end_idx)
 
-    var n = doc.input.byte_length()
-    var bytes_list = List[UInt8](capacity=n)
-    for j in range(n):
-        bytes_list.append(bytes[j])
-    var unescaped = unescape_json_string(bytes_list, start_idx, end_idx)
+    # Span-based unescape so we don't copy the entire input for every
+    # string with escapes; the unescape walker only needs the bytes
+    # between the quotes plus the unchanged context for surrogate
+    # pair lookahead.
+    var unescaped = unescape_json_string_span(bytes, start_idx, end_idx)
     var s = String(unsafe_from_utf8=unescaped^)
     var pool_idx = len(doc.string_pool)
     doc.string_pool.append(s^)
