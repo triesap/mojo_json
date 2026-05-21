@@ -48,6 +48,10 @@ comptime TAPE_TAG_OBJECT: UInt8 = 6
 # of input. Distinguishing keys at the tag level is convenient when walking
 # a tape that mixes keys and values (e.g., when iterating object_items).
 comptime TAPE_TAG_KEY: UInt8 = 7
+# Tag 8 is for STRING values that needed unescaping. They live in
+# string_pool the same way KEY entries live in key_pool. Clean strings
+# stay in TAPE_TAG_STRING and remain zero-copy slices into input.
+comptime TAPE_TAG_STRING_OWNED: UInt8 = 8
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +114,9 @@ struct Document(Copyable, Movable):
       - `key_pool` stores unescaped object keys. Object KEY entries store a
         pool offset rather than an offset into `input`, so unescaped keys
         survive even when the original bytes are released.
+      - `string_pool` stores unescaped STRING values that needed
+        materialisation (e.g. escapes). Clean strings stay zero-copy
+        as STRING (offset, length) entries into `input`.
       - `float_pool` stores `Float64` values, since 64-bit IEEE 754 doesn't
         fit in 60 bits.
       - `int_pool` is reserved for spilled large integers; in Phase A all
@@ -119,6 +126,7 @@ struct Document(Copyable, Movable):
     var input: String
     var tape: List[UInt64]
     var key_pool: List[String]
+    var string_pool: List[String]
     var float_pool: List[Float64]
     var int_pool: List[Int64]
 
@@ -126,6 +134,7 @@ struct Document(Copyable, Movable):
         self.input = String()
         self.tape = List[UInt64]()
         self.key_pool = List[String]()
+        self.string_pool = List[String]()
         self.float_pool = List[Float64]()
         self.int_pool = List[Int64]()
 
@@ -133,6 +142,7 @@ struct Document(Copyable, Movable):
         self.input = input^
         self.tape = List[UInt64]()
         self.key_pool = List[String]()
+        self.string_pool = List[String]()
         self.float_pool = List[Float64]()
         self.int_pool = List[Int64]()
 
@@ -141,6 +151,7 @@ struct Document(Copyable, Movable):
         d.input = self.input
         d.tape = self.tape.copy()
         d.key_pool = self.key_pool.copy()
+        d.string_pool = self.string_pool.copy()
         d.float_pool = self.float_pool.copy()
         d.int_pool = self.int_pool.copy()
         return d^
@@ -192,6 +203,21 @@ struct Document(Copyable, Movable):
         self.key_pool.append(key^)
         var idx = len(self.tape)
         self.tape.append(pack_tape_entry(TAPE_TAG_KEY, UInt64(pool_idx)))
+        return idx
+
+    def append_string_owned(mut self, var value: String) -> Int:
+        """Append a STRING_OWNED entry whose bytes live in string_pool.
+
+        Used for JSON strings that contain escapes (where a zero-copy
+        slice into `input` would expose the escaped bytes). Clean
+        strings stay on the zero-copy `append_string` path.
+        """
+        var pool_idx = len(self.string_pool)
+        self.string_pool.append(value^)
+        var idx = len(self.tape)
+        self.tape.append(
+            pack_tape_entry(TAPE_TAG_STRING_OWNED, UInt64(pool_idx))
+        )
         return idx
 
     def append_array(mut self, count: Int, child_start_idx: Int) -> Int:
@@ -248,12 +274,19 @@ struct Document(Copyable, Movable):
         return payload_lo30(self.get_payload(tape_idx))
 
     def get_string(self, tape_idx: Int) -> String:
-        """Materialize a STRING entry as a fresh `String`.
+        """Materialize a STRING / STRING_OWNED entry as a fresh `String`.
 
-        The returned string is a fresh copy of the slice of `input` that the
-        STRING entry references. This is safe even if `input` is later
-        consumed.
+        - For `TAPE_TAG_STRING` (clean / zero-copy), the returned string
+          is a fresh copy of the slice of `input` referenced by the
+          (offset, length) payload. Safe even if `input` is later
+          consumed.
+        - For `TAPE_TAG_STRING_OWNED` (had escapes at parse time), the
+          string is read out of `string_pool` and returned as-is.
         """
+        var tag = self.get_tag(tape_idx)
+        if tag == TAPE_TAG_STRING_OWNED:
+            var pool_idx = Int(self.get_payload(tape_idx))
+            return self.string_pool[pool_idx]
         var offset = self.get_string_offset(tape_idx)
         var length = self.get_string_length(tape_idx)
         return String(

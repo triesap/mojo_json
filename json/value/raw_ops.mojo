@@ -271,28 +271,35 @@ def _count_array_elements(raw: String) -> Int:
         elif c == UInt8(ord(",")) and depth == 1:
             count += 1
 
+    # `count` is the number of top-level commas. The element count is
+    # `commas + 1` unless the array body is empty / whitespace-only.
+    # Find the byte immediately after `[` and the byte immediately
+    # before the matching closing `]`, then look for any non-ws byte
+    # in between. (Nested brackets, strings, and escapes all count as
+    # content; a previous version of this routine missed those cases
+    # and silently returned 0 for arrays like `[[]]` or `[1]`.)
     var has_content = False
-    depth = 0
-    in_string = False
+    var open_at = -1
     for i in range(n):
-        var c = raw_bytes[i]
-        if c == UInt8(ord("[")):
-            depth += 1
-        elif c == UInt8(ord("]")):
-            depth -= 1
-        elif c == UInt8(ord('"')):
-            if depth == 1 and not in_string:
+        if raw_bytes[i] == UInt8(ord("[")):
+            open_at = i
+            break
+    var close_at = -1
+    for i in range(n - 1, -1, -1):
+        if raw_bytes[i] == UInt8(ord("]")):
+            close_at = i
+            break
+    if open_at >= 0 and close_at > open_at:
+        for j in range(open_at + 1, close_at):
+            var c = raw_bytes[j]
+            if (
+                c != UInt8(ord(" "))
+                and c != UInt8(ord("\t"))
+                and c != UInt8(ord("\n"))
+                and c != UInt8(ord("\r"))
+            ):
                 has_content = True
-            in_string = not in_string
-        elif (
-            depth == 1
-            and not in_string
-            and c != UInt8(ord(" "))
-            and c != UInt8(ord("\t"))
-            and c != UInt8(ord("\n"))
-            and c != UInt8(ord("\r"))
-        ):
-            has_content = True
+                break
 
     if has_content:
         count += 1
