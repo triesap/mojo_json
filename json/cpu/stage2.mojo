@@ -63,11 +63,39 @@ from ..document import (
     TAPE_TAG_KEY_INLINE,
 )
 from .stage1_scalar import StructuralIndex
+from .number_parse import parse_int_swar
 
 
 # ---------------------------------------------------------------------------
 # Whitespace + primitive end helpers
 # ---------------------------------------------------------------------------
+
+
+@always_inline
+def _string_has_escape(bytes: Span[UInt8, _], start: Int, end: Int) -> Bool:
+    """SIMD-accelerated scan for backslash in [start, end).
+
+    The dominant case on real JSON corpora is "no escape", so we scan
+    32 bytes at a time using `SIMD.eq` + `reduce_or` and only fall
+    back to a scalar loop for the tail (< 32 bytes) and to confirm
+    position when we *do* find one.
+    """
+    var n = end - start
+    if n <= 0:
+        return False
+    var ptr = bytes.unsafe_ptr()
+    var i = start
+    var stop = end - 32
+    while i <= stop:
+        var chunk = ptr.load[width=32](i)
+        if chunk.eq(UInt8(ord("\\"))).reduce_or():
+            return True
+        i += 32
+    while i < end:
+        if ptr[i] == UInt8(ord("\\")):
+            return True
+        i += 1
+    return False
 
 
 @always_inline
@@ -383,11 +411,7 @@ def _emit_string(
     var end_idx = close_quote
 
     var bytes = doc.input.as_bytes()
-    var has_escape = False
-    for j in range(start_idx, end_idx):
-        if bytes[j] == UInt8(ord("\\")):
-            has_escape = True
-            break
+    var has_escape = _string_has_escape(bytes, start_idx, end_idx)
 
     if not has_escape:
         return pack_tape_entry(
@@ -453,28 +477,9 @@ def _emit_number(
         var pool_idx = len(doc.float_pool)
         doc.float_pool.append(atof(num_str))
         return pack_tape_entry(TAPE_TAG_FLOAT, UInt64(pool_idx))
-    var v = _parse_int_inline(bytes, start, i)
+    var v = parse_int_swar(bytes, start, i)
     var payload = UInt64(v) & ((UInt64(1) << 60) - 1)
     return pack_tape_entry(TAPE_TAG_INT, payload)
-
-
-@always_inline
-def _parse_int_inline(bytes: Span[UInt8, _], start: Int, end: Int) -> Int64:
-    """SWAR-friendly signed integer parser. The Mojo compiler optimises
-    this tight loop into something close to an explicit SWAR sequence
-    for short numbers (1-9 digits), which is the common case in JSON."""
-    var i = start
-    var negative = False
-    if i < end and bytes[i] == UInt8(ord("-")):
-        negative = True
-        i += 1
-    var result: UInt64 = 0
-    while i < end:
-        result = result * 10 + UInt64(bytes[i]) - UInt64(ord("0"))
-        i += 1
-    if negative:
-        return -Int64(result)
-    return Int64(result)
 
 
 def _emit_array(
@@ -662,11 +667,7 @@ def _emit_object(
 
         var key_start = cursor + 1
         var key_len = key_close - key_start
-        var has_escape = False
-        for j in range(key_start, key_close):
-            if bytes[j] == UInt8(ord("\\")):
-                has_escape = True
-                break
+        var has_escape = _string_has_escape(bytes, key_start, key_close)
 
         if has_escape:
             # Slow path: keys with escapes still need allocation +
