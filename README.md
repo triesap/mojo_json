@@ -10,7 +10,7 @@ High-performance JSON library for Mojo with GPU acceleration.
 - **Reflection serde:** zero-boilerplate struct serialization via compile-time reflection
 - **GPU accelerated:** 2-4x faster than [cuJSON](https://github.com/AutomataLab/cuJSON) on large files (NVIDIA, AMD)
 - **Tape-backed Value:** v0.2 stores parsed JSON as a packed tape inside a `Document`; `Value` is a view; nested mutation propagates correctly
-- **Two-pass CPU parser:** stage 1 builds a structural index (scalar oracle + SIMD), stage 2 emits a packed `Document` tape; ~0.25 GB/s parse-only / 0.22 GB/s parse + full-DOM traversal on `twitter.json` (Apple Silicon, M-series), zero FFI. Pure Mojo path is ~13-16x slower than simdjson C++ in absolute terms — see [docs/performance.md](./docs/performance.md) for the methodology and the work left to close that gap.
+- **Two-pass CPU parser:** stage 1 builds a structural index via a 64-byte branchless SIMD scan (PSHUFB-style classifier + prefix-XOR escape tracking), stage 2 emits a packed `Document` tape with zero-copy keys / strings, SWAR 8-digit int parsing, and SIMD whitespace skip; ~1.17 GB/s parse-only / 0.57 GB/s parse + full-DOM traversal on `twitter.json` (Apple Silicon, M-series), zero FFI. Pure Mojo path is ~2.3-2.5x slower than simdjson C++ on parse-only — see [docs/performance.md](./docs/performance.md) for the methodology and the work left to close that gap.
 - **Streaming and lazy parsing:** handle files larger than memory
 - **JSONPath and Schema:** query and validate JSON documents
 - **RFC compliant:** JSON Patch, Merge Patch, JSON Pointer
@@ -121,18 +121,32 @@ workloads:
 
 | File | Size | simdjson `parse_only` | mojo `parse_only` (simd) | simdjson `parse_traverse` | mojo `parse_traverse` (simd) |
 |---|---|---|---|---|---|
-| `twitter.json` | 616 KB | 0.189 ms / 3.34 GB/s | 2.51 ms / 0.25 GB/s | 0.215 ms / 2.93 GB/s | 2.88 ms / 0.22 GB/s |
-| `citm_catalog.json` | 1.7 MB | 0.442 ms / 3.91 GB/s | 7.08 ms / 0.24 GB/s | 0.514 ms / 3.36 GB/s | 8.20 ms / 0.21 GB/s |
+| `twitter.json` | 616 KB | 0.235 ms / 2.68 GB/s | 0.54 ms / 1.17 GB/s | 0.236 ms / 2.67 GB/s | 1.12 ms / 0.57 GB/s |
+| `citm_catalog.json` | 1.7 MB | 0.440 ms / 3.92 GB/s | 1.09 ms / 1.58 GB/s | 0.528 ms / 3.27 GB/s | 2.49 ms / 0.69 GB/s |
 
-The honest gap on the M-series is ~13-16x: 13x on `twitter.json`,
-16x on `citm_catalog.json`, parse-only and parse+traverse alike.
-It's stable across both corpora, which means it's algorithmic —
-simdjson's two-stage SIMD pipeline plus tape-direct reads — not a
-benchmark artifact. The mojo `Value` is now exclusively a
-tape-backed view over a `Document`, so traversal cost is comparable
-to parse cost (no on-access rescans, no per-call allocations
-besides the document itself). Closing the remaining gap is parser
-work, not representation work — see [docs/performance.md](./docs/performance.md).
+The CPU gap on the M-series is now ~2.3-2.5x on `parse_only` and
+~4-5x on `parse_traverse`. That's a ~6x improvement over the
+v0.2.0 baseline of 0.25 GB/s, driven by a real two-stage SIMD
+pipeline — see [docs/performance.md](./docs/performance.md) for the
+breakdown:
+
+- **Stage 1**: branchless 64-byte structural index scan with a
+  PSHUFB-style nibble classifier and prefix-XOR escape tracking
+  (Mojo `SIMD._dynamic_shuffle` + `pack_bits`). Stage 1 in
+  isolation runs at 5+ GB/s.
+- **Stage 2**: zero-copy clean string and key slices (no
+  `key_pool` / `string_pool` allocation on the hot path); SWAR
+  8-digit integer parser; SIMD backslash scan and SIMD whitespace
+  skip with scalar prelude; bulk `memcpy` flush for object/array
+  children.
+
+The mojo `Value` is exclusively a tape-backed view over a
+`Document`, so traversal cost is comparable to parse cost (no
+on-access rescans, no per-call allocations besides the document
+itself). The remaining gap to native simdjson is dominated by
+recursive `_emit_value` call overhead and the absence of an
+Eisel-Lemire fast-path float parser; both are tracked in
+[docs/performance.md](./docs/performance.md).
 
 ```bash
 # Download large dataset (required for meaningful GPU benchmarks).

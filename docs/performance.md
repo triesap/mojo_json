@@ -177,31 +177,80 @@ Two workloads:
 
 | Corpus | Size | simdjson `parse_only` | mojo `parse_only` (simd) | simdjson `parse_traverse` | mojo `parse_traverse` (simd) |
 |---|---|---|---|---|---|
-| `twitter.json` | 616 KB | 0.189 ms / 3.34 GB/s | 2.51 ms / 0.25 GB/s | 0.215 ms / 2.93 GB/s | 2.88 ms / 0.22 GB/s |
-| `citm_catalog.json` | 1.7 MB | 0.442 ms / 3.91 GB/s | 7.08 ms / 0.24 GB/s | 0.514 ms / 3.36 GB/s | 8.20 ms / 0.21 GB/s |
+| `twitter.json` | 616 KB | 0.235 ms / 2.68 GB/s | 0.54 ms / 1.17 GB/s | 0.236 ms / 2.67 GB/s | 1.12 ms / 0.57 GB/s |
+| `citm_catalog.json` | 1.7 MB | 0.440 ms / 3.92 GB/s | 1.09 ms / 1.58 GB/s | 0.528 ms / 3.27 GB/s | 2.49 ms / 0.69 GB/s |
 
-* `parse_only` gap: 13x on `twitter.json`, 16x on `citm_catalog.json`.
-* `parse_traverse` gap: 13x and 16x respectively.
-* The traverse step adds only 13-15% over `parse_only` on the tape
-  path -- iteration is just a tape walk, not a re-parse.
+* `parse_only` gap: 2.3x on `twitter.json`, 2.5x on `citm_catalog.json`.
+* `parse_traverse` gap: ~4-5x on both corpora.
+* The Mojo `parse_traverse` cost is ~2x the `parse_only` cost --
+  traversal walks every tape slot and materializes zero-copy keys
+  / strings on demand. There is no on-access re-parse, no raw
+  substring rescan, and no per-iteration allocation other than the
+  document itself.
 * simdjson's `target='cpu-simdjson'` FFI shim is intentionally not
   in this table; the FFI marshalling cost dominates and it has not
   been competitive with the native Mojo path for several releases.
 
+### What landed in v0.2's parity push
+
+Stage 1 (structural indexing) -- now ~5+ GB/s in isolation:
+
+1. **PSHUFB-style nibble classifier** -- a single
+   `SIMD._dynamic_shuffle` pair plus an OR replaces the per-byte
+   `eq` chain that classified `{ } [ ] : , " \\` and whitespace.
+2. **Branchless 64-byte chunks** -- with `prefix_xor64` and
+   `find_escape_mask64` (the simdjson-style escape / in-string
+   branchless propagation), we process 64 bytes per iteration with
+   no per-marker scalar dispatch in the common case.
+3. **Two fast paths** -- chunks with no markers and no active
+   string state skip all bit-twiddling; chunks with no quotes /
+   backslashes and no active string emit structurals directly
+   without escape computation.
+
+Stage 2 (tape emission):
+
+4. **Zero-copy clean strings and keys** -- `TAPE_TAG_STRING` and
+   `TAPE_TAG_KEY_INLINE` store `(offset, length)` slices into
+   `Document.input`. No allocation, no `memcpy`, no
+   `string_pool` / `key_pool` append on the hot path. Only
+   strings / keys that actually contain escapes spill to the
+   side pools.
+5. **SWAR 8-digit integer parser** -- 8 ASCII digit bytes loaded
+   as a `SIMD[UInt8, 8]`, multiplied by a power-of-10 vector,
+   reduced with a single `reduce_add`. Compiles to a tight NEON
+   `umlal+addv` sequence; AVX2 gets `vpmulld+horizontal sum`.
+6. **SIMD backslash scan** -- the scalar "does this string contain
+   `\\`?" loop is replaced with a 32-byte `eq+reduce_or` scan,
+   exiting on the first chunk in the no-escape case.
+7. **SIMD whitespace skip with scalar prelude** -- 4-byte scalar
+   prelude for the dense-JSON case (0-3 ws bytes), then a 32-byte
+   SIMD body using `pack_bits` + `count_trailing_zeros` for
+   pretty-printed whitespace runs.
+8. **Bulk `memcpy` flush** -- when a container closes, its
+   children's headers are copied from `headers_scratch` into
+   `doc.tape` in one `memcpy` instead of one append per header.
+
 ### What's left to close the gap
 
-The remaining ~13-16x is algorithmic, not representational:
+The remaining ~2.3-2.5x on `parse_only` is algorithmic:
 
-1. **Stage 1 SIMD** still serialises through scalar disambiguation
-   for escaped quotes / inside-string state. simdjson uses
-   carry-less multiplication; we don't yet.
-2. **Number parsing** in stage 2 is byte-at-a-time. simdjson uses
-   SWAR and Eisel-Lemire.
-3. **Tape writing** allocates `List` capacity reactively. simdjson
-   estimates the tape size from the structural-index density and
-   over-allocates once.
+1. **Recursive `_emit_value`** dispatches via Mojo function calls
+   per child. simdjson uses a flat tape walker with no recursion;
+   replicating that needs a non-trivial state-machine refactor.
+2. **No Eisel-Lemire float fast path.** `_emit_number` still spills
+   to `atof` for floats. Eisel-Lemire would parse most floats
+   without allocation; integer parsing already uses SWAR.
+3. **Stage 2 still re-validates byte content** between adjacent
+   structurals to reject inputs like `[1foo, 2]`. simdjson trusts
+   stage 1's structural index fully; doing the same here would
+   remove the per-value `_skip_ws` re-scan but requires stage 1 to
+   detect non-whitespace, non-structural bytes outside strings.
+4. **AVX-512 64-byte chunks** are not yet enabled on hosts that
+   support `vpternlogq`; the 32-byte NEON / AVX2 path is what we
+   measure today.
 
-These are tracked in `.cursor/rules/plans.mdc` (Phase 7).
+These are tracked in `.cursor/rules/plans.mdc` (remaining Phase 6
+items).
 
 ## When to Use GPU vs CPU
 

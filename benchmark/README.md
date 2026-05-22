@@ -79,20 +79,23 @@ Two workloads per parser:
 
 | Corpus | Size | simdjson `parse_only` | mojo `parse_only` (simd) | simdjson `parse_traverse` | mojo `parse_traverse` (simd) |
 |---|---|---|---|---|---|
-| `twitter.json` | 616 KB | 0.189 ms / 3.34 GB/s | 2.51 ms / 0.25 GB/s | 0.215 ms / 2.93 GB/s | 2.88 ms / 0.22 GB/s |
-| `citm_catalog.json` | 1.7 MB | 0.442 ms / 3.91 GB/s | 7.08 ms / 0.24 GB/s | 0.514 ms / 3.36 GB/s | 8.20 ms / 0.21 GB/s |
+| `twitter.json` | 616 KB | 0.235 ms / 2.68 GB/s | 0.54 ms / 1.17 GB/s | 0.236 ms / 2.67 GB/s | 1.12 ms / 0.57 GB/s |
+| `citm_catalog.json` | 1.7 MB | 0.440 ms / 3.92 GB/s | 1.09 ms / 1.58 GB/s | 0.528 ms / 3.27 GB/s | 2.49 ms / 0.69 GB/s |
 
-The Mojo parse-vs-traverse delta is 13-15% on both corpora.
-Because the v0.2 `Value` is a tape-backed view over `Document`,
-traversal is just a tape walk -- there is no on-access re-parse,
+The Mojo `parse_traverse` cost is ~2x the `parse_only` cost on
+both corpora -- traversal walks every tape slot and materializes
+zero-copy keys/strings on demand. There is no on-access re-parse,
 no raw substring rescan, and no per-iteration allocation other
 than the document itself.
 
-The honest gap to native `simdjson` is ~13x on `twitter.json` and
-~16x on `citm_catalog.json` (parse-only and parse + traverse
-alike). It's stable across corpora, which makes it algorithmic
-(no carry-less multiplication in stage 1, scalar number parsing in
-stage 2, no tape pre-sizing), not a benchmark artefact. See
+The remaining gap to native `simdjson` is ~2.3-2.5x on
+`parse_only` and ~4-5x on `parse_traverse`. The parse-only gap is
+algorithmic: simdjson's tape walker dispatches on a single
+indexed-into-positions byte read with no recursion, while ours
+still uses recursive `_emit_value` calls and re-validates byte
+content for some edge cases. The traverse delta is dominated by
+the cost of materializing `Value` views and copying string slices
+out of the input on read. See
 [docs/performance.md](../docs/performance.md) for the breakdown.
 
 The `target='cpu-simdjson'` FFI shim is intentionally not in this
