@@ -75,7 +75,7 @@ def parse_gpu_to_value(
         Tape-backed `Value` view of the parsed document root.
     """
     var index = _result_to_index(input, gpu_result)
-    var doc = parse_into_document(input^, index^)
+    var doc = parse_into_document(input^, index)
     var root_idx = doc.root()
     var arc = ArcPointer[Document](doc^)
     return make_view_value(arc, root_idx)
