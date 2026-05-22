@@ -1,5 +1,17 @@
-// simdjson native benchmark - Full DOM traversal (comparable to json)
-// Compile: clang++ -O3 -std=c++17 -o bench_simdjson bench_simdjson.cpp -I$CONDA_PREFIX/include -L$CONDA_PREFIX/lib -lsimdjson
+// simdjson native benchmark - symmetric methodology with the json mojo
+// bench:
+//
+//   - 3 warmup iterations + 100 measured iterations
+//   - Two paths: parse_only (`parser.parse(s)`) and parse_traverse
+//     (parse + walk every node, accessing each leaf value)
+//   - Reports min/avg/max wall time and min-time-derived throughput
+//
+// Throughput is computed from the *minimum* iteration time so it is
+// directly comparable to the json mojo bench, which reports the same
+// statistic (the simdjson community convention).
+//
+// Compile: clang++ -O3 -std=c++17 -o bench_simdjson bench_simdjson.cpp \
+//              -I$CONDA_PREFIX/include -L$CONDA_PREFIX/lib -lsimdjson
 
 #include <iostream>
 #include <fstream>
@@ -7,10 +19,13 @@
 #include <chrono>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include "simdjson.h"
 
-// Count all values by traversing the DOM (similar to what json does)
-size_t traverse_element(simdjson::dom::element elem)
+// Walk the DOM, touching every leaf's value (string, number, bool).
+// This mirrors what the mojo bench's `_walk` does, so parse_traverse
+// numbers on both sides measure the same kind of work.
+static size_t traverse_element(simdjson::dom::element elem)
 {
     size_t count = 1;
     switch (elem.type())
@@ -24,12 +39,12 @@ size_t traverse_element(simdjson::dom::element elem)
     case simdjson::dom::element_type::OBJECT:
         for (auto [key, value] : elem.get_object().value())
         {
-            (void)key; // Access key (like json extracts keys)
+            (void)key;
             count += traverse_element(value);
         }
         break;
     case simdjson::dom::element_type::STRING:
-        (void)elem.get_string().value(); // Access string data
+        (void)elem.get_string().value();
         break;
     case simdjson::dom::element_type::INT64:
         (void)elem.get_int64().value();
@@ -49,6 +64,39 @@ size_t traverse_element(simdjson::dom::element elem)
     return count;
 }
 
+struct Stats
+{
+    double min_ms;
+    double avg_ms;
+    double max_ms;
+};
+
+static Stats summarize(const std::vector<double> &times)
+{
+    Stats s{times[0], 0.0, times[0]};
+    for (double t : times)
+    {
+        s.min_ms = std::min(s.min_ms, t);
+        s.max_ms = std::max(s.max_ms, t);
+        s.avg_ms += t;
+    }
+    s.avg_ms /= static_cast<double>(times.size());
+    return s;
+}
+
+static void print_row(const char *label,
+                      const Stats &s,
+                      size_t file_size)
+{
+    double throughput = (file_size / 1e9) / (s.min_ms / 1000.0);
+    std::cout << "  " << label
+              << ": min " << s.min_ms << " ms"
+              << " | avg " << s.avg_ms << " ms"
+              << " | max " << s.max_ms << " ms"
+              << " | " << throughput << " GB/s (min-based)"
+              << std::endl;
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 2)
@@ -59,7 +107,6 @@ int main(int argc, char *argv[])
 
     std::string filepath = argv[1];
 
-    // Read file
     std::ifstream file(filepath);
     if (!file)
     {
@@ -71,57 +118,67 @@ int main(int argc, char *argv[])
     std::string json_str = buffer.str();
     size_t file_size = json_str.size();
 
-    std::cout << "\n--- simdjson native (C++) - Full DOM Traversal ---" << std::endl;
+    std::cout << "\n--- simdjson native (C++) ---" << std::endl;
     std::cout << "File: " << filepath << std::endl;
-    std::cout << "Size: " << file_size << " bytes (" << (file_size / 1024.0) << " KB)" << std::endl;
+    std::cout << "Size: " << file_size << " bytes ("
+              << (file_size / 1024.0) << " KB)" << std::endl;
     std::cout << std::endl;
 
-    // Use DOM parser which builds full tree (like json)
+    // simdjson reuses one parser instance across iterations, which
+    // amortizes its internal scratch buffer allocations. The mojo
+    // bench builds a fresh `Document` per iteration, so this is the
+    // closest like-for-like setup we can offer the C++ side.
     simdjson::dom::parser parser;
 
-    // Warmup
-    for (int i = 0; i < 3; i++)
+    constexpr int num_warmup = 3;
+    constexpr int num_iters = 100;
+
+    // Warmup (both paths).
+    for (int i = 0; i < num_warmup; i++)
     {
         auto doc = parser.parse(json_str);
-        traverse_element(doc.value());
+        (void)traverse_element(doc.value());
     }
 
-    // Benchmark
-    int num_iters = 100;
-    std::vector<double> times;
-    times.reserve(num_iters);
-    size_t total_nodes = 0;
-
+    // ---- parse_only ----
+    std::vector<double> parse_only_times;
+    parse_only_times.reserve(num_iters);
     for (int i = 0; i < num_iters; i++)
     {
-        auto start = std::chrono::high_resolution_clock::now();
+        auto t0 = std::chrono::high_resolution_clock::now();
+        auto doc = parser.parse(json_str);
+        // Touch the root tag so the optimizer cannot elide the parse.
+        (void)doc.value().type();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        parse_only_times.push_back(
+            std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+
+    // ---- parse_traverse ----
+    std::vector<double> parse_traverse_times;
+    parse_traverse_times.reserve(num_iters);
+    size_t total_nodes = 0;
+    for (int i = 0; i < num_iters; i++)
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
         auto doc = parser.parse(json_str);
         total_nodes = traverse_element(doc.value());
-        auto end = std::chrono::high_resolution_clock::now();
-
-        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
-        times.push_back(elapsed_ms);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        parse_traverse_times.push_back(
+            std::chrono::duration<double, std::milli>(t1 - t0).count());
     }
 
-    // Calculate stats
-    double min_time = times[0], max_time = times[0], total_time = 0;
-    for (double t : times)
-    {
-        if (t < min_time)
-            min_time = t;
-        if (t > max_time)
-            max_time = t;
-        total_time += t;
-    }
-    double avg_time = total_time / num_iters;
-    double throughput = (file_size / 1e9) / (min_time / 1000.0);
+    auto parse_only = summarize(parse_only_times);
+    auto parse_traverse = summarize(parse_traverse_times);
 
+    std::cout << "Iterations: " << num_iters
+              << " (warmup " << num_warmup << ")" << std::endl;
     std::cout << "Nodes:      " << total_nodes << std::endl;
-    std::cout << "Iterations: " << num_iters << std::endl;
-    std::cout << "Min time:   " << min_time << " ms" << std::endl;
-    std::cout << "Avg time:   " << avg_time << " ms" << std::endl;
-    std::cout << "Max time:   " << max_time << " ms" << std::endl;
-    std::cout << "Throughput: " << throughput << " GB/s" << std::endl;
+    std::cout << std::endl;
+
+    print_row("parse_only    ", parse_only, file_size);
+    print_row("parse_traverse", parse_traverse, file_size);
+    std::cout << std::endl;
 
     return 0;
 }
