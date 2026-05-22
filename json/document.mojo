@@ -44,14 +44,23 @@ comptime TAPE_TAG_FLOAT: UInt8 = 3
 comptime TAPE_TAG_STRING: UInt8 = 4
 comptime TAPE_TAG_ARRAY: UInt8 = 5
 comptime TAPE_TAG_OBJECT: UInt8 = 6
-# Tag 7 is reserved for object KEY entries that point into key_pool instead
-# of input. Distinguishing keys at the tag level is convenient when walking
-# a tape that mixes keys and values (e.g., when iterating object_items).
+# Tag 7: object KEY entries that point into key_pool. Used when the key
+# had to be unescaped at parse time, or when keys are produced by an
+# upstream source (e.g. simdjson FFI, owned-tree materialization) that
+# does not preserve the original input bytes.
 comptime TAPE_TAG_KEY: UInt8 = 7
 # Tag 8 is for STRING values that needed unescaping. They live in
 # string_pool the same way KEY entries live in key_pool. Clean strings
 # stay in TAPE_TAG_STRING and remain zero-copy slices into input.
 comptime TAPE_TAG_STRING_OWNED: UInt8 = 8
+# Tag 9: zero-copy object KEY entries that store a (offset, length) pair
+# into `Document.input`, identical to TAPE_TAG_STRING but with a different
+# tag so iterators can distinguish keys from values without a sidecar.
+# This is the by-far-most-common shape on real-world JSON corpora -- most
+# object keys never contain escapes -- so emitting this tag instead of
+# TAPE_TAG_KEY removes the per-key heap allocation + key_pool append from
+# stage 2's hot path.
+comptime TAPE_TAG_KEY_INLINE: UInt8 = 9
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +214,22 @@ struct Document(Copyable, Movable):
         self.tape.append(pack_tape_entry(TAPE_TAG_KEY, UInt64(pool_idx)))
         return idx
 
+    def append_key_inline(mut self, offset: Int, length: Int) -> Int:
+        """Append a zero-copy KEY entry referencing input[offset:offset+length].
+
+        Used for the by-far-common case where the JSON key contains no
+        escapes -- avoids the per-key heap allocation, memcpy, and
+        key_pool append.
+        """
+        var idx = len(self.tape)
+        self.tape.append(
+            pack_tape_entry(
+                TAPE_TAG_KEY_INLINE,
+                pack_pair(UInt64(offset), UInt64(length)),
+            )
+        )
+        return idx
+
     def append_string_owned(mut self, var value: String) -> Int:
         """Append a STRING_OWNED entry whose bytes live in string_pool.
 
@@ -294,7 +319,21 @@ struct Document(Copyable, Movable):
         )
 
     def get_key(self, tape_idx: Int) -> String:
-        """Return the unescaped key for a KEY entry."""
+        """Return the unescaped key for a KEY / KEY_INLINE entry.
+
+        Dispatches on the tag: TAPE_TAG_KEY is a key_pool index (used
+        when the key had escapes, or when an upstream source produced
+        the key as an owned string); TAPE_TAG_KEY_INLINE is a
+        zero-copy `(offset, length)` slice into `input` that we copy
+        out on read.
+        """
+        var tag = self.get_tag(tape_idx)
+        if tag == TAPE_TAG_KEY_INLINE:
+            var offset = self.get_string_offset(tape_idx)
+            var length = self.get_string_length(tape_idx)
+            return String(
+                unsafe_from_utf8=self.input.as_bytes()[offset : offset + length]
+            )
         var pool_idx = Int(self.get_payload(tape_idx))
         return self.key_pool[pool_idx]
 

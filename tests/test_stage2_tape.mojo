@@ -34,6 +34,7 @@ from json.document import (
     TAPE_TAG_ARRAY,
     TAPE_TAG_OBJECT,
     TAPE_TAG_KEY,
+    TAPE_TAG_KEY_INLINE,
 )
 from json import loads
 from json.value import Value
@@ -106,9 +107,10 @@ def _assert_tape_value_matches_value(
             var pair = items[i].copy()
             var k = pair[0]
             var val = pair[1].copy()
-            assert_equal(
-                Int(d.get_tag(key_idx)),
-                Int(TAPE_TAG_KEY),
+            var key_tag = Int(d.get_tag(key_idx))
+            assert_true(
+                key_tag == Int(TAPE_TAG_KEY)
+                or key_tag == Int(TAPE_TAG_KEY_INLINE),
                 label + ": key tag",
             )
             assert_equal(
@@ -227,10 +229,10 @@ def test_object_layout_flat() raises:
     assert_equal(Int(d.get_tag(4)), Int(TAPE_TAG_OBJECT))
     assert_equal(d.get_count(4), 2)
     assert_equal(d.get_child_start(4), 0)
-    assert_equal(Int(d.get_tag(0)), Int(TAPE_TAG_KEY))
+    assert_equal(Int(d.get_tag(0)), Int(TAPE_TAG_KEY_INLINE))
     assert_equal(d.get_key(0), String("a"))
     assert_equal(Int(d.get_int(1)), 1)
-    assert_equal(Int(d.get_tag(2)), Int(TAPE_TAG_KEY))
+    assert_equal(Int(d.get_tag(2)), Int(TAPE_TAG_KEY_INLINE))
     assert_equal(d.get_key(2), String("b"))
     assert_equal(Int(d.get_int(3)), 2)
 
@@ -247,13 +249,13 @@ def test_object_layout_nested() raises:
     assert_equal(Int(d.get_tag(d.root())), Int(TAPE_TAG_OBJECT))
     assert_equal(d.get_count(d.root()), 1)
     var cs = d.get_child_start(d.root())
-    assert_equal(Int(d.get_tag(cs)), Int(TAPE_TAG_KEY))
+    assert_equal(Int(d.get_tag(cs)), Int(TAPE_TAG_KEY_INLINE))
     assert_equal(d.get_key(cs), String("k"))
     var inner_idx = cs + 1
     assert_equal(Int(d.get_tag(inner_idx)), Int(TAPE_TAG_OBJECT))
     assert_equal(d.get_count(inner_idx), 1)
     var inner_cs = d.get_child_start(inner_idx)
-    assert_equal(Int(d.get_tag(inner_cs)), Int(TAPE_TAG_KEY))
+    assert_equal(Int(d.get_tag(inner_cs)), Int(TAPE_TAG_KEY_INLINE))
     assert_equal(d.get_key(inner_cs), String("x"))
     assert_equal(Int(d.get_int(inner_cs + 1)), 1)
 

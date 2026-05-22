@@ -60,6 +60,7 @@ from ..document import (
     TAPE_TAG_ARRAY,
     TAPE_TAG_OBJECT,
     TAPE_TAG_KEY,
+    TAPE_TAG_KEY_INLINE,
 )
 from .stage1_scalar import StructuralIndex
 
@@ -642,9 +643,9 @@ def _emit_object(
         raise Error("Stage 2: unterminated object")
 
     while True:
-        var key_pool_idx: Int
         var after_key: Int
         var value_start: Int
+        var key_header: UInt64
 
         # Local scope for `bytes` borrow so we can mutate doc later.
         var bytes = doc.input.as_bytes()
@@ -666,20 +667,23 @@ def _emit_object(
             if bytes[j] == UInt8(ord("\\")):
                 has_escape = True
                 break
-        var key: String
+
         if has_escape:
+            # Slow path: keys with escapes still need allocation +
+            # interning. They're rare on real JSON corpora.
             _validate_escapes(bytes, key_start, key_close)
             var unesc = unescape_json_string_span(bytes, key_start, key_close)
-            key = String(unsafe_from_utf8=unesc^)
+            var key = String(unsafe_from_utf8=unesc^)
+            var key_pool_idx = len(doc.key_pool)
+            doc.key_pool.append(key^)
+            key_header = pack_tape_entry(TAPE_TAG_KEY, UInt64(key_pool_idx))
         else:
-            var key_bytes = List[UInt8](capacity=key_len)
-            key_bytes.resize(key_len, 0)
-            memcpy(
-                dest=key_bytes.unsafe_ptr(),
-                src=bytes.unsafe_ptr() + key_start,
-                count=key_len,
+            # Fast path: zero-copy KEY_INLINE -- store (offset, length)
+            # into input. No allocation, no memcpy, no key_pool append.
+            key_header = pack_tape_entry(
+                TAPE_TAG_KEY_INLINE,
+                pack_pair(UInt64(key_start), UInt64(key_len)),
             )
-            key = String(unsafe_from_utf8=key_bytes^)
 
         # Find the colon while we still have the bytes borrow.
         after_key = _skip_ws(bytes, key_close + 1, n)
@@ -695,12 +699,7 @@ def _emit_object(
                 + String(after_key)
             )
 
-        # Now drop the bytes borrow and write to doc.
-        key_pool_idx = len(doc.key_pool)
-        doc.key_pool.append(key^)
-        headers_scratch.append(
-            pack_tape_entry(TAPE_TAG_KEY, UInt64(key_pool_idx))
-        )
+        headers_scratch.append(key_header)
 
         if pos_idx >= len(positions) or Int(positions[pos_idx]) != after_key:
             raise Error("Stage 2: cursor desync at object colon")
