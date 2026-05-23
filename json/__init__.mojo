@@ -26,9 +26,10 @@ v0.2 changes worth knowing:
 - The default CPU parser is the two-pass stage 1 + stage 2 walker
   (`json.cpu.parse_cpu_native_tape`); `parse_mojo` / `parse_simd` and
   the `MojoJSONParser` / `FastParser` types are gone.
-- `loads[target='gpu']` on Apple Silicon raises by default; recompile
-  with `-D JSON_GPU_ALLOW_APPLE_FALLBACK=1` to keep the v0.1 silent
-  CPU fallback.
+- `loads[target='gpu']` runs natively on NVIDIA, AMD, and Apple Metal
+  (since v0.2.0 -- `gpu/kernels.mojo` emits a raw structural bitmap
+  and `gpu/tape_adapter.mojo` filters it CPU-side, which sidesteps the
+  cross-chunk escape-bitmap quirks Apple's prior in-string mask had).
 - Typed NDJSON file load: `load[format='ndjson'](path) -> List[Value]`.
 - Configured parsing / serialisation use the two-arg overloads:
   `loads(s, config)` and `dumps(v, config)`.

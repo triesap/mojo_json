@@ -3,7 +3,6 @@
 
 from std.collections import List
 from std.memory import memcpy, ArcPointer
-from std.sys import has_apple_gpu_accelerator, is_defined
 
 from .value import Value, Null, make_view_value
 from .serialize import dumps
@@ -327,25 +326,12 @@ def loads[target: StaticString = "cpu"](s: String) raises -> Value:
     elif target == "cpu-simdjson":
         return _parse_cpu["simdjson"](s)
     elif target == "gpu":
-        # Apple Silicon's Metal backend in the current Mojo nightly does not
-        # yet fully support raw-pointer GPU kernels. v0.1 silently fell back
-        # to CPU here, which masked perf surprises. v0.2 raises an explicit
-        # error; opt in to the legacy fallback by compiling with
-        # `-D JSON_GPU_ALLOW_APPLE_FALLBACK=1`.
-        comptime if has_apple_gpu_accelerator():
-            comptime if is_defined["JSON_GPU_ALLOW_APPLE_FALLBACK"]():
-                return _parse_cpu["mojo"](s)
-            else:
-                raise Error(
-                    "loads[target='gpu'] is not supported on Apple Silicon in"
-                    " this Mojo nightly (Metal backend lacks raw-pointer"
-                    " kernel support). Use loads(s) (CPU, ~1.4 GB/s) or"
-                    " loads[target='cpu-simdjson'](s) instead. To opt into"
-                    " the legacy silent CPU fallback, recompile with"
-                    " -D JSON_GPU_ALLOW_APPLE_FALLBACK=1."
-                )
-        else:
-            return _parse_gpu(s)
+        # As of v0.2 the GPU pipeline runs natively on NVIDIA, AMD, and
+        # Apple Metal. The Metal correctness fix lives in
+        # `gpu/kernels.mojo` (raw structural bitmap) and
+        # `gpu/tape_adapter.mojo` (CPU-side string-state filter); see
+        # `_parse_gpu` for the entry point.
+        return _parse_gpu(s)
     else:
         return _parse_cpu["mojo"](s)
 

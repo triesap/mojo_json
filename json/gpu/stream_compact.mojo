@@ -406,3 +406,156 @@ def extract_positions_gpu(
     )
 
     return (positions^, char_types^, total_count)
+
+
+def extract_positions_gpu_lean(
+    ctx: DeviceContext,
+    d_bitmap_ptr: UnsafePointer[UInt32, MutAnyOrigin],
+    num_words: Int,
+    max_byte_pos: Int,
+) raises -> List[Int32]:
+    """Stream-compact a structural bitmap into a position list, no char_types.
+
+    Same algorithm as `extract_positions_gpu` but skips the char_types
+    output buffer + D2H copy. Used by the v0.2 Apple Metal lean
+    pipeline, where `tape_adapter` only consumes structural positions
+    (the v0.1 bracket-matcher's char_types are dead work).
+
+    Returns just the positions list (caller already knows
+    `max_byte_pos`).
+    """
+    var num_blocks = ceildiv(num_words, BLOCK_SIZE_OPT)
+
+    var d_popcounts = ctx.enqueue_create_buffer[DType.uint32](num_words)
+    ctx.enqueue_function_unchecked[popcount_kernel](
+        d_bitmap_ptr,
+        d_popcounts.unsafe_ptr(),
+        UInt(num_words),
+        grid_dim=num_blocks,
+        block_dim=BLOCK_SIZE_OPT,
+    )
+
+    var d_prefix = ctx.enqueue_create_buffer[DType.uint32](num_words)
+    var d_block_totals = ctx.enqueue_create_buffer[DType.uint32](num_blocks)
+    d_block_totals.enqueue_fill(0)
+
+    ctx.enqueue_function_unchecked[prefix_sum_kernel](
+        d_popcounts.unsafe_ptr(),
+        d_prefix.unsafe_ptr(),
+        d_block_totals.unsafe_ptr(),
+        UInt(num_words),
+        grid_dim=num_blocks,
+        block_dim=BLOCK_SIZE_OPT,
+    )
+
+    var total_count: Int
+    if num_blocks == 1:
+        ctx.synchronize()
+        var h_block_totals = ctx.enqueue_create_host_buffer[DType.uint32](
+            num_blocks
+        )
+        ctx.enqueue_copy(h_block_totals, d_block_totals)
+        ctx.synchronize()
+        total_count = Int(h_block_totals.unsafe_ptr()[0])
+    else:
+        var d_block_prefix = ctx.enqueue_create_buffer[DType.uint32](num_blocks)
+        d_block_prefix.enqueue_fill(0)
+
+        _compute_block_prefix_sums(
+            ctx,
+            d_block_totals.unsafe_ptr(),
+            d_block_prefix.unsafe_ptr(),
+            num_blocks,
+        )
+
+        ctx.enqueue_function_unchecked[add_block_offsets_kernel](
+            d_prefix.unsafe_ptr(),
+            d_block_prefix.unsafe_ptr(),
+            UInt(num_words),
+            grid_dim=num_blocks,
+            block_dim=BLOCK_SIZE_OPT,
+        )
+
+        ctx.synchronize()
+        var h_block_totals = ctx.enqueue_create_host_buffer[DType.uint32](
+            num_blocks
+        )
+        var h_block_prefix = ctx.enqueue_create_host_buffer[DType.uint32](
+            num_blocks
+        )
+        ctx.enqueue_copy(h_block_totals, d_block_totals)
+        ctx.enqueue_copy(h_block_prefix, d_block_prefix)
+        ctx.synchronize()
+        total_count = Int(h_block_prefix.unsafe_ptr()[num_blocks - 1]) + Int(
+            h_block_totals.unsafe_ptr()[num_blocks - 1]
+        )
+
+    if total_count == 0:
+        return List[Int32]()
+
+    var d_positions = ctx.enqueue_create_buffer[DType.int32](total_count)
+    d_positions.enqueue_fill(0)
+
+    ctx.enqueue_function_unchecked[scatter_positions_lean_kernel](
+        d_bitmap_ptr,
+        d_prefix.unsafe_ptr(),
+        d_positions.unsafe_ptr(),
+        UInt(num_words),
+        UInt(max_byte_pos),
+        grid_dim=num_blocks,
+        block_dim=BLOCK_SIZE_OPT,
+    )
+
+    var h_positions = ctx.enqueue_create_host_buffer[DType.int32](total_count)
+    ctx.enqueue_copy(h_positions, d_positions)
+    ctx.synchronize()
+
+    var positions = List[Int32](capacity=total_count)
+    positions.resize(total_count, 0)
+    memcpy(
+        dest=positions.unsafe_ptr(),
+        src=h_positions.unsafe_ptr(),
+        count=total_count,
+    )
+
+    return positions^
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
+        Int32(Int(BLOCK_SIZE_OPT))
+    )
+)
+def scatter_positions_lean_kernel(
+    bitmap: UnsafePointer[UInt32, MutAnyOrigin],
+    prefix_offsets: UnsafePointer[UInt32, MutAnyOrigin],
+    output_positions: UnsafePointer[Int32, MutAnyOrigin],
+    num_words: UInt,
+    max_byte_pos: UInt,
+):
+    """Lean scatter -- positions only, no char-type lookup.
+
+    Skips the input-data load + char-type encoding done by
+    `scatter_positions_kernel`. Saves one byte read per emitted
+    position and one byte write to the char_types buffer.
+    """
+    var gid = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
+    if gid >= Int(num_words):
+        return
+
+    var bits = bitmap[gid]
+    if bits == 0:
+        return
+
+    var base_pos = gid * 32
+    var write_idx = Int(prefix_offsets[gid])
+
+    while bits != 0:
+        var tz = _ctz32_gpu(bits)
+        var pos = base_pos + Int(tz)
+
+        if pos < Int(max_byte_pos):
+            output_positions[write_idx] = Int32(pos)
+            write_idx += 1
+
+        bits = bits & (bits - 1)

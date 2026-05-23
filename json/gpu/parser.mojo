@@ -14,7 +14,7 @@ from std.gpu.memory import AddressSpace
 from std.collections import List
 from std.memory import UnsafePointer, memcpy
 from std.math import ceildiv
-from std.sys import has_accelerator
+from std.sys import has_accelerator, has_apple_gpu_accelerator
 from std.time import perf_counter_ns
 from std.utils.static_tuple import StaticTuple
 
@@ -26,7 +26,7 @@ from .kernels import (
     structural_popcount_kernel,
     extract_positions_kernel,
 )
-from .stream_compact import extract_positions_gpu
+from .stream_compact import extract_positions_gpu, extract_positions_gpu_lean
 
 
 def parse_json_gpu(
@@ -56,6 +56,19 @@ def parse_json_gpu(
     var total_padded_32 = (size + 31) // 32
 
     var ctx = DeviceContext()
+    comptime if has_apple_gpu_accelerator():
+        # Apple Metal lean pipeline: `fused_json_kernel` discards
+        # `quote_prefix_in` (cross-chunk and escaped-quote correctness
+        # moved to `tape_adapter._result_to_index` on the CPU side),
+        # so the popcount + hierarchical prefix-sum stages from the
+        # NVIDIA / AMD path are dead work on Apple. We also skip the
+        # CPU `_match_brackets_fast` step because the v0.2 tape
+        # adapter doesn't consume `pair_pos`. That removes ~30% of
+        # GPU work, 5 device buffers, and the largest CPU phase from
+        # each launch.
+        return _parse_json_gpu_apple_lean(
+            ctx, input^, size, total_padded_32, verbose
+        )
     return _parse_json_gpu_optimized(
         ctx, input^, size, total_padded_32, verbose
     )
@@ -93,6 +106,108 @@ def parse_json_gpu_from_pinned(
     return _parse_json_gpu_from_pinned_impl(
         ctx, h_input, size, total_padded_32, verbose
     )
+
+
+def _parse_json_gpu_apple_lean(
+    ctx: DeviceContext,
+    var input: JSONInput,
+    size: Int,
+    total_padded_32: Int,
+    verbose: Bool,
+) raises -> JSONResult:
+    """Apple Metal lean pipeline.
+
+    Drops the four kernel launches and five device buffers that the
+    NVIDIA / AMD path uses for in-string detection -- the
+    correctness path moved to `tape_adapter._result_to_index` so
+    the GPU-side popcount + prefix-sum work is dead. Also skips the
+    CPU `_match_brackets_fast` pass because the v0.2 tape adapter
+    only consumes `result.structural`, never `result.pair_pos`.
+
+    Per-input footprint reduces from ~7x size to ~3x size, and
+    per-input wall-clock drops by the time previously spent on
+    bracket matching (~50% on twitter_large_record).
+
+    Notes for future readers: `fused_json_kernel`'s body reads
+    `quote_prefix_in[global_id]` once and discards it. Metal AOT
+    does buffer-binding alias analysis and rejects the kernel if
+    that pointer aliases a write target, so we allocate a small
+    dedicated `d_quote_dummy` buffer instead. It's never read for
+    correctness; whatever the device leaves in there is fine.
+    """
+    var result = JSONResult()
+    result.file_size = size
+
+    var num_blocks = ceildiv(total_padded_32, BLOCK_SIZE_OPT)
+    if num_blocks == 0:
+        num_blocks = 1
+
+    var t0 = perf_counter_ns()
+
+    var d_input = ctx.enqueue_create_buffer[DType.uint8](size)
+    var h_input = ctx.enqueue_create_host_buffer[DType.uint8](size)
+    memcpy(dest=h_input.unsafe_ptr(), src=input.data.unsafe_ptr(), count=size)
+    ctx.enqueue_copy(d_input, h_input)
+
+    var d_structural = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
+    var d_open_close = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
+    # See docstring for why this exists. Read-only dummy for the
+    # kernel's `quote_prefix_in` parameter.
+    var d_quote_dummy = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
+
+    if verbose:
+        ctx.synchronize()
+        var t_h2d = perf_counter_ns()
+        print("    [lean] H2D + alloc:", Float64(t_h2d - t0) / 1e6, "ms")
+
+    ctx.enqueue_function_unchecked[fused_json_kernel](
+        d_input.unsafe_ptr(),
+        d_structural.unsafe_ptr(),
+        d_open_close.unsafe_ptr(),
+        d_quote_dummy.unsafe_ptr(),
+        UInt(size),
+        UInt(total_padded_32),
+        grid_dim=num_blocks,
+        block_dim=BLOCK_SIZE_OPT,
+    )
+
+    ctx.synchronize()
+    var t1 = perf_counter_ns()
+    if verbose:
+        print("    [lean] fused kernel:", Float64(t1 - t0) / 1e6, "ms")
+
+    # Lean extractor: positions only, skips char_types entirely
+    # (scatter kernel work + 66 MB D2H on twitter_large_record).
+    result.structural = extract_positions_gpu_lean(
+        ctx,
+        d_structural.unsafe_ptr(),
+        total_padded_32,
+        size,
+    )
+    # `pair_pos` is unused by the v0.2 tape adapter, but downstream
+    # code still indexes it for legacy iterator compatibility. Empty
+    # list with capacity matching structural count is enough -- we
+    # never write to it on this path.
+    result.pair_pos = List[Int32](capacity=len(result.structural))
+    result.pair_pos.resize(len(result.structural), -1)
+
+    if verbose:
+        var t2 = perf_counter_ns()
+        var total_ms = Float64(t2 - t0) / 1e6
+        var gbps = (Float64(size) / 1e9) / (total_ms / 1e3)
+        print(
+            "    [lean] position extract:",
+            Float64(t2 - t1) / 1e6,
+            "ms; total",
+            total_ms,
+            "ms,",
+            gbps,
+            "GB/s,",
+            len(result.structural),
+            "structurals",
+        )
+
+    return result^
 
 
 def _parse_json_gpu_optimized(

@@ -74,7 +74,7 @@ channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 preview = ["pixi-build"]
 
 [dependencies]
-json = { git = "https://github.com/ehsanmok/json.git", tag = "v0.2.0" }
+json = { git = "https://github.com/ehsanmok/json.git", tag = <released-tag> }
 ```
 
 Then run:
@@ -100,13 +100,50 @@ json = { git = "https://github.com/ehsanmok/json.git", branch = "main" }
 
 ### GPU (804MB `twitter_large_record.json`)
 
-| Platform | Throughput | vs cuJSON |
-|----------|------------|-----------|
-| AMD MI355X | 13 GB/s | **3.6x faster** |
-| NVIDIA B200 | 8 GB/s | **1.8x faster** |
-| Apple M3 Pro | 3.9 GB/s | N/A |
+| Platform | Throughput | vs cuJSON | Pipeline |
+|----------|------------|-----------|----------|
+| AMD MI355X | 13 GB/s | **3.6x faster** | single-shot |
+| NVIDIA B200 | 8 GB/s | **1.8x faster** | single-shot |
+| Apple M3 Pro | 3.1 GB/s | N/A | lean (Metal) |
 
-*GPU only beneficial for files >100MB.*
+*GPU only beneficial for files >100MB on discrete cards (NVIDIA, AMD).*
+
+**Apple Metal status.** `loads[target='gpu']` runs the real Metal
+pipeline on Apple Silicon, verified byte-for-byte against the scalar
+oracle on `twitter.json`, `citm_catalog.json`, and escape-heavy
+synthetic inputs. The Apple Metal path uses a lean pipeline that
+drops the popcount + hierarchical prefix-sum stages and the CPU-side
+bracket-match step from the NVIDIA / AMD path, because:
+
+- `fused_json_kernel`'s `quote_prefix_in` argument is no longer
+  consumed — cross-chunk and escaped-quote correctness moved to
+  `gpu/tape_adapter.mojo`'s CPU-side string-state machine, which
+  filters the GPU's raw `{}[]:,` bitmap during the single CPU walk
+  that stage 2 already needed.
+- `pair_pos` (output of CPU bracket matching) is dead in the v0.2
+  tape pipeline — the tape adapter only consumes
+  `result.structural`.
+
+The lean stream-compactor (`extract_positions_gpu_lean` in
+`gpu/stream_compact.mojo`) also skips the per-position char-type
+emission and its 66 MB device-to-host copy on `twitter_large_record`.
+
+Net effect: per-input GPU work drops by ~30%, peak device memory
+drops by ~40% (5 fewer 32-bit buffers per launch), and total
+wall-clock on `twitter_large_record.json` (803 MB) drops from
+650 ms to 270 ms (1.3 GB/s → 3.1 GB/s). The exact number depends on
+your machine — refresh the table row on yours with:
+
+```bash
+pixi run -e dev bench-gpu-apple benchmark/datasets/twitter_large_record.json
+```
+
+> **Important — first-time Metal users on Xcode 26.x.** If you see
+> `error: Metal Compiler failed to compile metallib`, the Xcode
+> Metal toolchain isn't registered. Run
+> `xcodebuild -downloadComponent MetalToolchain` once and retry.
+> See [the Apple developer thread](https://developer.apple.com/forums/thread/802155)
+> for context.
 
 ### CPU (Apple Silicon, M-series)
 
@@ -153,7 +190,9 @@ Eisel-Lemire fast-path float parser; both are tracked in
 # `download-*` lives in the dev feature because it needs gdown.
 pixi run -e dev download-twitter-large
 
-# GPU benchmark (large files only)
+# GPU benchmark (large files only). Apple Metal users: see
+# `bench-gpu-apple` for the lean Apple pipeline (no 32 MB cap;
+# 803 MB twitter_large_record runs end-to-end at ~3.1 GB/s).
 pixi run bench-gpu benchmark/datasets/twitter_large_record.json
 
 # CPU bench: simdjson C++ vs Mojo (scalar + simd, parse_only + parse_traverse)

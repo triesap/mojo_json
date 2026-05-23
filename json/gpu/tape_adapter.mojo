@@ -112,11 +112,23 @@ def _result_to_index(
         var c = bytes[i]
 
         if escaped:
+            # Skip the byte after a backslash. Drop any GPU position
+            # that falls on it (e.g. an escaped `,` or `:` inside a
+            # string body) so it does not leak out when we re-emerge.
+            while gpu_idx < gpu_size and Int(gpu_positions[gpu_idx]) <= i:
+                gpu_idx += 1
             escaped = False
             i += 1
             continue
 
         if in_string:
+            # Inside a string literal: drop any GPU position that
+            # falls on this byte. The GPU kernel emits the *raw*
+            # `{}[]:,` bitmap (it doesn't know which bytes live
+            # inside string literals), so the in-string string body
+            # is exactly where we filter that noise out.
+            while gpu_idx < gpu_size and Int(gpu_positions[gpu_idx]) <= i:
+                gpu_idx += 1
             if c == UInt8(ord("\\")):
                 escaped = True
                 i += 1
@@ -129,18 +141,20 @@ def _result_to_index(
             i += 1
             continue
 
-        # Outside a string: drain any GPU positions strictly less than `i`.
-        # (Defensive: well-formed GPU output never lags behind the byte
-        # cursor, but we never trust GPU output blindly.)
-        while gpu_idx < gpu_size and Int(gpu_positions[gpu_idx]) < i:
-            index.positions.append(UInt32(gpu_positions[gpu_idx]))
-            gpu_idx += 1
-
         if c == UInt8(ord('"')):
             index.positions.append(UInt32(i))
             in_string = True
             i += 1
             continue
+
+        # Outside a string: emit the GPU position at this byte if
+        # there is one. Defensive bounded drain handles any
+        # mis-ordered GPU output (well-formed output never lags
+        # behind the byte cursor, but we never trust GPU output
+        # blindly).
+        while gpu_idx < gpu_size and Int(gpu_positions[gpu_idx]) < i:
+            index.positions.append(UInt32(gpu_positions[gpu_idx]))
+            gpu_idx += 1
 
         if gpu_idx < gpu_size and Int(gpu_positions[gpu_idx]) == i:
             index.positions.append(UInt32(gpu_positions[gpu_idx]))
@@ -148,10 +162,8 @@ def _result_to_index(
 
         i += 1
 
-    while gpu_idx < gpu_size:
-        index.positions.append(UInt32(gpu_positions[gpu_idx]))
-        gpu_idx += 1
-
+    # Anything left after the byte cursor is past the input -- drop
+    # it, since it cannot correspond to a real structural position.
     return index^
 
 

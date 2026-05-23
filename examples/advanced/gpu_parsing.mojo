@@ -1,30 +1,17 @@
 # GPU-accelerated parsing
 #
 # Demonstrates ``loads[target="gpu"]`` and ``load[target="gpu"]`` for
-# GPU parsing on machines with a CUDA / ROCm accelerator.
-#
-# Apple Silicon caveat
-# --------------------
-# The GPU pipeline relies on raw-pointer kernels that the Metal
-# backend does not currently support. ``loads[target="gpu"]`` raises
-# on Apple Silicon by default; recompile with
-# ``-D JSON_GPU_ALLOW_APPLE_FALLBACK=1`` to opt back into a silent
-# CPU fallback (useful for typechecking / dev-on-Mac). On Apple
-# Silicon without the flag this example detects the platform and
-# prints a guidance message instead of crashing.
+# GPU parsing on NVIDIA (CUDA), AMD (ROCm), and Apple Metal hosts.
 #
 # Performance
 # -----------
 # GPU parsing wins on large documents (MB+ sized). For small inputs,
-# CPU parsing is faster because of kernel launch overhead and host
-# <-> device data transfer.
+# CPU parsing is typically faster because of kernel launch overhead
+# and host <-> device data transfer.
 
-from std.sys import has_apple_gpu_accelerator, is_defined
+from std.sys import has_accelerator
 
 from json import loads, load, dumps, Value
-
-
-comptime _APPLE_FALLBACK = is_defined["JSON_GPU_ALLOW_APPLE_FALLBACK"]()
 
 
 def _demo() raises:
@@ -81,23 +68,11 @@ def main() raises:
     print("=" * 40)
     print()
 
-    comptime if not _APPLE_FALLBACK:
-        if has_apple_gpu_accelerator():
-            print(
-                "Detected Apple Silicon without"
-                " -D JSON_GPU_ALLOW_APPLE_FALLBACK=1."
-            )
-            print(
-                "loads[target='gpu'] would raise here. To run this example"
-                " on this Mac, recompile with:"
-            )
-            print(
-                "    pixi run mojo -D JSON_GPU_ALLOW_APPLE_FALLBACK=1 -I ."
-                " examples/advanced/gpu_parsing.mojo"
-            )
-            print(
-                "Or use 'pixi run example-gpu' which sets the flag for you."
-            )
-            return
+    comptime if not has_accelerator():
+        print(
+            "No GPU detected. Build on a host with a CUDA, ROCm, or Apple"
+            " Metal accelerator to run this example."
+        )
+        return
 
     _demo()

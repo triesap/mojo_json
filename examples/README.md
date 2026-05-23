@@ -83,15 +83,11 @@ have a real workload to optimise.
 | `advanced/lazy_parsing.mojo` | `loads[lazy=True]` + `LazyValue`: type-specific getters, path-based access, when lazy beats full parse |
 | `advanced/gpu_parsing.mojo`  | `loads[target="gpu"]` / `load[target="gpu"]`: GPU pipeline, when GPU wins, Apple-Silicon caveat |
 
-`advanced/gpu_parsing.mojo` is platform-aware:
-
-- On Linux / NVIDIA / AMD it runs the real GPU pipeline.
-- On Apple Silicon it prints a guidance message instead of crashing,
-  because Mojo's Metal backend currently lacks raw-pointer kernel
-  support. Recompile with
-  `-D JSON_GPU_ALLOW_APPLE_FALLBACK=1` (or run `pixi run example-gpu`,
-  which sets the flag for you) to exercise the path under the silent
-  CPU fallback shim.
+`advanced/gpu_parsing.mojo` runs the real GPU pipeline on NVIDIA, AMD,
+and Apple Metal hosts. On hosts without any accelerator it prints a
+guidance message and exits cleanly. The Apple Metal toolchain ships
+with Xcode (install via
+`xcodebuild -downloadComponent MetalToolchain` if it's missing).
 
 ## Discovering more
 

@@ -126,33 +126,42 @@ def fused_json_kernel(
         )
         open_close_bits |= bit_mask * UInt32(is_bracket)
 
-    # Step 2: Find escaped quotes (simplified - quotes preceded by odd backslashes)
-    var overflow: UInt32 = 0
-    if global_id > 0:
-        # Check previous word for trailing backslash (simplified)
-        # In full implementation, would check for odd-length backslash sequences
-        pass
+    # NOTE: in-string detection on the GPU side is intentionally not
+    # used here. The previous formulation
+    #
+    #     escaped       = quote_bits & (slash_bits << 1)
+    #     real_quotes   = quote_bits & ~escaped
+    #     pxor          = prefix_xor_fast(real_quotes)
+    #     in_string     = pxor (xor-flipped by quote_prefix_in[global_id]&1)
+    #     structural    = (~in_string) & op_bits
+    #
+    # is *not* a correct implementation of the simdjson escape model.
+    # `slash_bits << 1` only catches `\"` *within* a 32-byte chunk, so
+    # a backslash at byte 31 of one chunk followed by a quote at byte
+    # 0 of the next chunk is not caught. It also doesn't distinguish
+    # odd vs even backslash runs, so `\\"` (literal `\` followed by a
+    # real quote) is wrongly classified as an escaped quote. Both bugs
+    # flip the in-string carry and erase real structural positions,
+    # which is exactly what made twitter.json fail the moment the
+    # Apple-fallback stopped masking it.
+    #
+    # The fix is to emit the *raw* `{}[]:,` bitmap and have the CPU
+    # side (`tape_adapter._result_to_index`) drop positions that fall
+    # inside string literals using its own correct, byte-by-byte
+    # escape state machine. The CPU pass was already walking the input
+    # to recover quote positions for stage 2, so this adds no extra
+    # scan -- it just uses the existing walk to filter the GPU output.
+    #
+    # `quote_prefix_in` / `slash_bits` / `quote_bits` remain in scope
+    # so that the kernel ABI is stable for the host launch and so a
+    # future, correct GPU escape implementation can drop in here
+    # without changing the call site.
+    _ = slash_bits
+    _ = quote_bits
+    _ = quote_prefix_in[global_id]
 
-    var escaped = quote_bits & (slash_bits << 1)
-    var real_quotes = quote_bits & (~escaped)
-
-    # Step 3: Compute in-string using prefix XOR
-    var pxor = prefix_xor_fast(real_quotes)
-
-    # Use pre-computed prefix sums to handle cross-word boundaries
-    var prefix_odd = (quote_prefix_in[global_id] & 1) != 0
-    if prefix_odd:
-        pxor = ~pxor
-
-    var in_string = pxor
-
-    # Step 4: Extract structural chars outside strings
-    var structural = (~in_string) & op_bits
-    var structural_open_close = (~in_string) & open_close_bits
-
-    # Write results
-    output_structural[global_id] = structural
-    output_open_close[global_id] = structural_open_close
+    output_structural[global_id] = op_bits
+    output_open_close[global_id] = open_close_bits
 
 
 @__llvm_metadata(
