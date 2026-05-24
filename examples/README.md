@@ -81,13 +81,13 @@ have a real workload to optimise.
 | File | What it covers |
 |------|---|
 | `advanced/lazy_parsing.mojo` | `loads[lazy=True]` + `LazyValue`: type-specific getters, path-based access, when lazy beats full parse |
-| `advanced/gpu_parsing.mojo`  | `loads[target="gpu"]` / `load[target="gpu"]`: GPU pipeline, when GPU wins, Apple-Silicon caveat |
+| `advanced/gpu_parsing.mojo`  | `loads[target="gpu"]` / `load[target="gpu"]`: GPU pipeline on NVIDIA, AMD, and Apple Metal |
 
-`advanced/gpu_parsing.mojo` runs the real GPU pipeline on NVIDIA, AMD,
-and Apple Metal hosts. On hosts without any accelerator it prints a
-guidance message and exits cleanly. The Apple Metal toolchain ships
-with Xcode (install via
-`xcodebuild -downloadComponent MetalToolchain` if it's missing).
+`advanced/gpu_parsing.mojo` runs the real GPU pipeline on NVIDIA,
+AMD, and Apple Metal hosts. On hosts without any accelerator it
+prints a guidance message and exits cleanly. On Xcode 26.x, run
+`xcodebuild -downloadComponent MetalToolchain` once if `mojo build`
+reports `Metal Compiler failed to compile metallib`.
 
 ## Discovering more
 

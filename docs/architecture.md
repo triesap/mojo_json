@@ -41,10 +41,14 @@ graph TB
     document --> dumps
 ```
 
-Apple Silicon `target='gpu'` raises by default (Metal backend lacks
-raw-pointer kernels in the current Mojo nightly). Recompile with
-`-D JSON_GPU_ALLOW_APPLE_FALLBACK=1` to opt into the legacy silent CPU
-fallback.
+`target='gpu'` runs natively on NVIDIA, AMD, and Apple Metal. The
+Apple Metal path emits the raw `{}[]:,` bitmap from
+`fused_json_kernel` and lets `gpu/tape_adapter.mojo` apply the
+in-string filter on the CPU side, which sidesteps the cross-chunk
+escape edge cases that the GPU-side mask would otherwise miss. Apple
+Metal also runs a lean variant that drops the popcount and
+hierarchical prefix-sum stages and the CPU bracket-match pass,
+because the v0.2 tape adapter does not consume `pair_pos`.
 
 ## CPU Backends
 
@@ -75,25 +79,26 @@ bytes for structure.
 
 **Performance (Apple Silicon, M-series; `pixi run -e dev bench-cpu`):**
 
-Both benches use the same protocol -- 3 warmup + 100 measured
+Both benches use the same protocol: 3 warmup + 100 measured
 iterations, min-time-derived throughput. The bench reports two
 workloads per parser:
 
-* `parse_only` -- `loads(...)` + peek the root tag.
-* `parse_traverse` -- parse + recursively visit every leaf via
+* `parse_only`: `loads(...)` + peek the root tag.
+* `parse_traverse`: parse + recursively visit every leaf via
   the public `Value` API.
 
-| Corpus | Size | simdjson `parse_only` | mojo `parse_only` (simd) | simdjson `parse_traverse` | mojo `parse_traverse` (simd) |
+| Corpus | Size | simdjson `parse_only` | mojo `parse_only` | simdjson `parse_traverse` | mojo `parse_traverse` |
 |---|---|---|---|---|---|
-| `twitter.json` | 616 KB | 0.189 ms / 3.34 GB/s | 2.51 ms / 0.25 GB/s | 0.215 ms / 2.93 GB/s | 2.88 ms / 0.22 GB/s |
-| `citm_catalog.json` | 1.7 MB | 0.442 ms / 3.91 GB/s | 7.08 ms / 0.24 GB/s | 0.514 ms / 3.36 GB/s | 8.20 ms / 0.21 GB/s |
+| `twitter.json` | 616 KB | 0.235 ms / 2.68 GB/s | 0.54 ms / 1.17 GB/s | 0.236 ms / 2.67 GB/s | 1.12 ms / 0.57 GB/s |
+| `citm_catalog.json` | 1.7 MB | 0.440 ms / 3.92 GB/s | 1.09 ms / 1.58 GB/s | 0.528 ms / 3.27 GB/s | 2.49 ms / 0.69 GB/s |
 
-The traverse step adds only 13-15% over `parse_only` on the Mojo
-side because every `Value` is a stable tape index -- iteration is
-just a tape walk, not a re-parse. The remaining ~13-16x to simdjson
-is algorithmic (no carry-less multiplication in stage 1, scalar
-number parsing in stage 2, no tape-size pre-estimation); see
-[performance.md](./performance.md) for the breakdown.
+`parse_traverse` only adds a small constant on top of `parse_only`
+on the Mojo side because every `Value` is a stable tape index, so
+iteration is a tape walk and not a re-parse. The remaining 2.3-2.5x
+to native simdjson on `parse_only` is algorithmic (no Eisel-Lemire
+float fast path, recursive emission rather than a flat tape walker,
+no AVX-512 64-byte chunks). Full breakdown in
+[performance.md](./performance.md).
 
 **Usage:**
 ```mojo
@@ -145,13 +150,19 @@ var data = loads[target="cpu-simdjson"]('{"key": "value"}')
 - `json/gpu/stream_compact.mojo` - GPU stream compaction for position extraction
 - `json/gpu/bracket_match.mojo` - GPU parallel bracket matching (experimental; the main parse path uses a CPU stack matcher after stream compaction)
 
-**Performance:** ~8 GB/s on NVIDIA B200 (1.8x faster than cuJSON)
+**Performance (804 MB `twitter_large_record.json`):**
+
+| Platform | Throughput | vs cuJSON | Pipeline |
+|---|---:|---|---|
+| AMD MI355X | 13 GB/s | 3.6x | single-shot |
+| NVIDIA B200 | 8 GB/s | 1.8x | single-shot |
+| Apple M3 Pro | 3.1 GB/s | n/a | lean Metal |
 
 **Techniques:**
 - Bitmap-based parsing
 - Parallel prefix sums
 - GPU stream compaction for position extraction
-- Hybrid GPU/CPU pipeline
+- Hybrid GPU/CPU pipeline (Apple Metal: in-string filter on CPU)
 
 ### GPU Pipeline
 

@@ -117,15 +117,29 @@ pixi run bench-gpu -- --debug-timing benchmark/datasets/twitter_large_record.jso
 
 ## Benchmark Results
 
-### GPU Performance (NVIDIA B200)
+### GPU Performance
 
-**Important:** GPU benchmarks are only meaningful for large files (>100MB). For smaller files, GPU launch overhead dominates and results are not representative of actual performance.
+GPU benchmarks are only meaningful for large files (>100 MB). For
+smaller files, GPU launch overhead dominates and the results are
+not representative.
 
-| Dataset | Size | Pinned Path | Speedup vs cuJSON |
-|---------|------|-------------|-------------------|
-| twitter_large_record.json | 804 MB | 7.0 GB/s | **2.0x** |
+804 MB `twitter_large_record.json`:
 
-GPU parallelism shines with large files where the overhead is amortized.
+| Platform | Throughput | vs cuJSON | Pipeline |
+|---|---:|---|---|
+| AMD MI355X | 13 GB/s | **3.6x** | single-shot |
+| NVIDIA B200 | 8 GB/s | **1.8x** | single-shot |
+| Apple M3 Pro | 3.1 GB/s | n/a | lean Metal |
+
+The Apple Metal path runs a lean variant of the NVIDIA / AMD
+pipeline: it drops the popcount and hierarchical prefix-sum stages
+(the GPU-side in-string mask is not used), drops the CPU
+`_match_brackets_fast` pass (the v0.2 tape adapter does not consume
+`pair_pos`), and emits a positions-only stream-compaction output
+(skipping the `char_types` D2H copy, which is around 66 MB on
+`twitter_large_record`). `gpu/tape_adapter.mojo` applies the
+in-string filter on the CPU side using the same byte walk that
+stage 2 already needed.
 
 ## CPU Performance
 
@@ -353,9 +367,10 @@ See [benchmark/readme.md](../benchmark/readme.md) for complete setup instruction
 
 ## Hardware Requirements
 
-- **GPU:** NVIDIA GPU with CUDA support (tested on B200, H100, A100) or Apple Silicon
-- **CUDA:** Latest CUDA toolkit (for NVIDIA)
-- **Memory:** At least 2x your largest JSON file size (for GPU buffers)
+- **GPU:** NVIDIA (CUDA 7.0+, tested on B200, H100, A100), AMD (ROCm 6+, tested on MI355X), or Apple Silicon (Metal, tested on M3 Pro).
+- **CUDA:** Latest CUDA toolkit (for NVIDIA).
+- **Apple Metal:** Xcode with Metal Toolchain registered. On Xcode 26.x, run `xcodebuild -downloadComponent MetalToolchain` once if `mojo build` reports `Metal Compiler failed to compile metallib`.
+- **Memory:** At least 2x your largest JSON file size (for GPU buffers).
 
 ## References
 

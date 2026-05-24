@@ -4,69 +4,27 @@
 [![Docs](https://github.com/ehsanmok/json/actions/workflows/docs.yaml/badge.svg)](https://ehsanmok.github.io/json/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-High-performance JSON library for Mojo with GPU acceleration.
-
-- **Python-like API:** `loads`, `dumps`, `load`, `dump`
-- **Reflection serde:** zero-boilerplate struct serialization via compile-time reflection
-- **GPU accelerated:** 2-4x faster than [cuJSON](https://github.com/AutomataLab/cuJSON) on large files (NVIDIA, AMD)
-- **Tape-backed Value:** v0.2 stores parsed JSON as a packed tape inside a `Document`; `Value` is a view; nested mutation propagates correctly
-- **Two-pass CPU parser:** stage 1 builds a structural index via a 64-byte branchless SIMD scan (PSHUFB-style classifier + prefix-XOR escape tracking), stage 2 emits a packed `Document` tape with zero-copy keys / strings, SWAR 8-digit int parsing, and SIMD whitespace skip; ~1.17 GB/s parse-only / 0.57 GB/s parse + full-DOM traversal on `twitter.json` (Apple Silicon, M-series), zero FFI. Pure Mojo path is ~2.3-2.5x slower than simdjson C++ on parse-only — see [docs/performance.md](./docs/performance.md) for the methodology and the work left to close that gap.
-- **Streaming and lazy parsing:** handle files larger than memory
-- **JSONPath and Schema:** query and validate JSON documents
-- **RFC compliant:** JSON Patch, Merge Patch, JSON Pointer
-
-## Quick Start
+**High-performance JSON for Mojo.** Pure-Mojo two-pass CPU parser, GPU-accelerated parsing on NVIDIA, AMD, and Apple Metal, tape-backed `Document` shared by every backend, reflection serde with zero boilerplate, RFC-compliant JSONPath, JSON Patch, and JSON Schema. The simdjson FFI shim is opt-in for the cases where you need it.
 
 ```mojo
-from json import loads, dumps, load, dump
+from json import loads, dumps
 
-# Parse & serialize strings
 var data = loads('{"name": "Alice", "scores": [95, 87, 92]}')
-print(data["name"].string_value())  # Alice
-print(data["scores"][0].int_value())  # 95
-print(dumps(data, indent="  "))  # Pretty print
-
-# File I/O
-var config = load("config.json")
-var logs = load[format="ndjson"]("events.ndjson")  # Returns List[Value]
-
-# Explicit GPU parsing (NVIDIA / AMD; Apple Silicon raises by default)
-var big = load[target="gpu"]("large.json")
+print(data["name"].string_value())     # Alice
+print(data["scores"][0].int_value())   # 95
+print(dumps(data, indent="  "))        # pretty print
 ```
 
-### One-line prelude
+## Why json
 
-For everyday code, `json.prelude` re-exports the names you reach for
-all the time -- `loads`, `dumps`, `load`, `dump`, `Value`, `Null`,
-`ParserConfig`, `SerializerConfig`, and the reflection serde
-shortcuts. The canonical import block collapses to one line:
+- **Pure Mojo, zero FFI on the hot path.** The default CPU parser is a 64-byte branchless SIMD scan (PSHUFB-style classifier with prefix-XOR escape tracking) that emits a packed `Document` tape. The simdjson FFI shim is opt-in via `target="cpu-simdjson"`.
+- **One representation across CPU and GPU.** Every backend writes into the same tape-backed `Document`. `Value` is a stable index into that tape, so iteration is a tape walk rather than a re-parse, and nested mutation propagates through the parent (`doc["a"]["b"].set(...)` is observed by `doc`).
+- **GPU that wins on big files.** AMD MI355X hits 13 GB/s (3.6x cuJSON) and NVIDIA B200 hits 8 GB/s (1.8x cuJSON) on the 804 MB `twitter_large_record.json`. Apple M3 Pro runs the lean Metal pipeline at 3.1 GB/s on the same file, no CPU fallback. [Numbers below.](#performance)
+- **Reflection serde with no boilerplate.** `serialize_json(struct)` and `deserialize_json[T](json)` walk struct fields at compile time, no hand-written `to_json` / `from_json` needed. Custom traits (`JsonSerializable`, `JsonDeserializable`) override the default for one type without abandoning reflection for the rest.
+- **Strict where it matters, lenient where it asks for it.** RFC 7159 by default; opt into comments, trailing commas, and a custom max-depth via `ParserConfig`.
+- **Fuzzed.** Five mozz harnesses (parser, simdjson FFI, Value access, JSONPath, NDJSON) with a differential property that simdjson and the native parser must agree on canonical `dumps` output, plus an ASan harness over the FFI and tape boundaries.
 
-```mojo
-from json.prelude import *
-
-@fieldwise_init
-struct Person(Defaultable, Movable):
-    var name: String
-    var age:  Int
-    def __init__(out self):
-        self.name = ""
-        self.age = 0
-
-def main() raises:
-    var p = deserialize_json[Person]('{"name":"Alice","age":30}')
-    print(p.name, p.age)
-    print(dumps(serialize_value(p), indent="  "))
-```
-
-Domain-specific surfaces (jsonpath / patch / schema / lazy / streaming
-/ manual serde traits / simdjson FFI) are intentionally **not** in the
-prelude -- import those from the matching module so the import block
-of a real file still documents which features it actually uses. See
-[`json/prelude.mojo`](./json/prelude.mojo) for the exact list.
-
-## Installation
-
-Add json to your project's `pixi.toml`:
+## Install
 
 ```toml
 [workspace]
@@ -74,317 +32,228 @@ channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 preview = ["pixi-build"]
 
 [dependencies]
-json = { git = "https://github.com/ehsanmok/json.git", tag = <released-tag> }
+json = { git = "https://github.com/ehsanmok/json.git", tag = "<latest-release>" }
 ```
-
-Then run:
 
 ```bash
 pixi install
 ```
 
-Requires [pixi](https://pixi.sh) (pulls Mojo nightly automatically).
+Requires [pixi](https://pixi.sh). Pin to a [released tag](https://github.com/ehsanmok/json/releases) for reproducible builds; track unreleased work via `branch = "main"` (breaking changes possible between tags).
 
-For the latest development version:
+`mojo` and `simdjson` install as transitive dependencies. The simdjson FFI wrapper builds on environment activation, no manual step.
 
-```toml
-[dependencies]
-json = { git = "https://github.com/ehsanmok/json.git", branch = "main" }
+For GPU acceleration: NVIDIA CUDA 7.0+, AMD ROCm 6+, or Apple Silicon. See [GPU compatibility](https://docs.modular.com/max/packages#gpu-compatibility).
+
+## Quick start
+
+The tour below walks the snippet at the top of this README from beginner to advanced. Each level adds one concept; everything compiles, and the runnable equivalents live under [`examples/`](./examples/) (every one is part of `pixi run tests`).
+
+### Beginner: parse and serialize
+
+```mojo
+from json.prelude import *  # loads, dumps, load, dump, Value, Null, ParserConfig, SerializerConfig, ...
+
+def main() raises:
+    var data = loads('{"name": "Alice", "scores": [95, 87, 92]}')
+    print(data["name"].string_value())     # Alice
+    print(data["scores"][0].int_value())   # 95
+    print(dumps(data, indent="  "))        # pretty print
+
+    var config = load("config.json")
+    var logs   = load[format="ndjson"]("events.ndjson")  # List[Value]
 ```
 
-> **Note:** `mojo-compiler` and `simdjson` are automatically installed as dependencies.
+`json.prelude` re-exports the everyday surface (`loads`, `dumps`, `load`, `dump`, `Value`, `Null`, `ParserConfig`, `SerializerConfig`, the reflection serde shortcuts). Domain-specific surfaces (jsonpath, patch, schema, lazy, streaming, manual serde traits, simdjson FFI) stay in their own modules so an import block still documents which features a file actually uses. Full list: [`json/prelude.mojo`](./json/prelude.mojo).
 
-**GPU (optional):** NVIDIA CUDA 7.0+, AMD ROCm 6+, or Apple Silicon. See [GPU requirements](https://docs.modular.com/max/packages#gpu-compatibility).
+### Intermediate: typed serde via reflection
+
+Promote a hand-written `to_json` / `from_json` pair to a single struct definition. Compile-time reflection walks the fields once at compile time and emits the same code a hand-written serde would.
+
+```mojo
+from json import serialize_json, deserialize_json, try_deserialize_json
+
+@fieldwise_init
+struct Person(Defaultable, Movable):
+    var name:   String
+    var age:    Int
+    var active: Bool
+
+    def __init__(out self):
+        self.name   = ""
+        self.age    = 0
+        self.active = False
+
+def main() raises:
+    var p = deserialize_json[Person]('{"name":"Alice","age":30,"active":true}')
+    print(p.name, p.age, p.active)
+    print(serialize_json[pretty=True](p))
+
+    # Non-raising variant for input that may not parse.
+    var maybe = try_deserialize_json[Person]('{"bad": json')
+    if not maybe:
+        print("invalid input")
+```
+
+Supported field types: `Int`, `Int64`, `Bool`, `Float64`, `Float32`, `String`, `List[T]`, `Optional[T]`, nested structs, `Value` (raw passthrough), `Dict[String, T]`, and nested `List` / `Optional` combinations. For full control on a single type, implement `JsonSerializable` / `JsonDeserializable`; the rest of the struct keeps using reflection. See [`docs/api.md`](./docs/api.md).
+
+### Advanced: GPU parsing for big files
+
+```mojo
+from json import load
+
+def main() raises:
+    var data = load[target="gpu"]("twitter_large_record.json")
+    print(data.array_count())
+```
+
+Dispatch is compile-time (`target="gpu"`); the runtime picks NVIDIA, AMD, or Apple Metal based on what's present. The Mojo native CPU parser is the right call below ~100 MB; GPU launch overhead dominates smaller files.
+
+For NDJSON, lazy parsing, streaming, JSONPath, JSON Patch, and JSON Schema, see [`examples/`](./examples/) (one example per topic, indexed in [`examples/README.md`](./examples/README.md)).
 
 ## Performance
 
-### GPU (804MB `twitter_large_record.json`)
+### GPU on `twitter_large_record.json` (804 MB)
 
 | Platform | Throughput | vs cuJSON | Pipeline |
-|----------|------------|-----------|----------|
-| AMD MI355X | 13 GB/s | **3.6x faster** | single-shot |
-| NVIDIA B200 | 8 GB/s | **1.8x faster** | single-shot |
-| Apple M3 Pro | 3.1 GB/s | N/A | lean (Metal) |
+|---|---:|---|---|
+| AMD MI355X | 13 GB/s | **3.6x** | single-shot |
+| NVIDIA B200 | 8 GB/s | **1.8x** | single-shot |
+| Apple M3 Pro | 3.1 GB/s | n/a | lean Metal |
 
-*GPU only beneficial for files >100MB on discrete cards (NVIDIA, AMD).*
+*GPU is only beneficial for files >100 MB on discrete cards (NVIDIA, AMD).*
 
-### CPU (Apple Silicon, M-series)
+### CPU on Apple Silicon, M-series
 
-`pixi run -e dev bench-cpu <file>` runs simdjson C++ first, then the
-Mojo CPU path; both benches use the same protocol (3 warmup + 100
-measured iterations, min-time-derived throughput) and the same two
-workloads:
+`pixi run -e dev bench-cpu <file>` runs the simdjson C++ reference first, then the Mojo CPU path. Both use the same protocol: 3 warmup + 100 measured iterations, min-time-derived throughput. Two workloads:
 
-- **`parse_only`** -- `loads(...)` and peek the root tag.
-- **`parse_traverse`** -- parse and walk every leaf value (the
-  realistic workload for any code that actually consumes the document).
+- `parse_only`: `loads(...)` and peek the root tag. Measures parse cost in isolation.
+- `parse_traverse`: parse and walk every leaf via the public API. The realistic workload for any code that actually consumes the document.
 
-| File | Size | simdjson `parse_only` | mojo `parse_only` (simd) | simdjson `parse_traverse` | mojo `parse_traverse` (simd) |
+| File | Size | simdjson `parse_only` | mojo `parse_only` | simdjson `parse_traverse` | mojo `parse_traverse` |
 |---|---|---|---|---|---|
 | `twitter.json` | 616 KB | 0.235 ms / 2.68 GB/s | 0.54 ms / 1.17 GB/s | 0.236 ms / 2.67 GB/s | 1.12 ms / 0.57 GB/s |
 | `citm_catalog.json` | 1.7 MB | 0.440 ms / 3.92 GB/s | 1.09 ms / 1.58 GB/s | 0.528 ms / 3.27 GB/s | 2.49 ms / 0.69 GB/s |
 
-The CPU gap on the M-series is now ~2.3-2.5x on `parse_only` and
-~4-5x on `parse_traverse`. That's a ~6x improvement over the
-v0.2.0 baseline of 0.25 GB/s, driven by a real two-stage SIMD
-pipeline — see [docs/performance.md](./docs/performance.md) for the
-breakdown:
-
-- **Stage 1**: branchless 64-byte structural index scan with a
-  PSHUFB-style nibble classifier and prefix-XOR escape tracking
-  (Mojo `SIMD._dynamic_shuffle` + `pack_bits`). Stage 1 in
-  isolation runs at 5+ GB/s.
-- **Stage 2**: zero-copy clean string and key slices (no
-  `key_pool` / `string_pool` allocation on the hot path); SWAR
-  8-digit integer parser; SIMD backslash scan and SIMD whitespace
-  skip with scalar prelude; bulk `memcpy` flush for object/array
-  children.
-
-The mojo `Value` is exclusively a tape-backed view over a
-`Document`, so traversal cost is comparable to parse cost (no
-on-access rescans, no per-call allocations besides the document
-itself). The remaining gap to native simdjson is dominated by
-recursive `_emit_value` call overhead and the absence of an
-Eisel-Lemire fast-path float parser; both are tracked in
-[docs/performance.md](./docs/performance.md).
+`parse_traverse` only adds a small constant on top of `parse_only` because every `Value` is a stable tape index, so traversal is a tape walk and not a re-parse. The remaining 2.3-2.5x to native simdjson on `parse_only` is algorithmic (no Eisel-Lemire float fast path, recursive emission rather than a flat tape walker, no AVX-512 64-byte chunks). Full breakdown in [`docs/performance.md`](./docs/performance.md).
 
 ```bash
-# Download large dataset (required for meaningful GPU benchmarks).
-# `download-*` lives in the dev feature because it needs gdown.
+# Optional: download cuJSON datasets for end-to-end GPU runs.
 pixi run -e dev download-twitter-large
 
-# GPU benchmark (large files only). Apple Metal users: see
-# `bench-gpu-apple` for the lean Apple pipeline (no 32 MB cap;
-# 803 MB twitter_large_record runs end-to-end at ~3.1 GB/s).
-pixi run bench-gpu benchmark/datasets/twitter_large_record.json
-
-# CPU bench: simdjson C++ vs Mojo (scalar + simd, parse_only + parse_traverse)
+# CPU bench (simdjson C++ vs mojo)
 pixi run -e dev bench-cpu                                            # twitter.json
 pixi run -e dev bench-cpu benchmark/datasets/citm_catalog.json
-pixi run -e dev bench-cpu benchmark/datasets/twitter_large_record.json
+
+# GPU bench (large files only)
+pixi run bench-gpu benchmark/datasets/twitter_large_record.json
+
+# Apple Metal sweep across multiple files
+pixi run -e dev bench-gpu-apple
 ```
 
-## Reflection-Based Serde (Zero Boilerplate)
+> **Apple Metal users on Xcode 26.x.** If `bench-gpu` errors with `Metal Compiler failed to compile metallib`, run `xcodebuild -downloadComponent MetalToolchain` once to register the toolchain. See [the Apple developer thread](https://developer.apple.com/forums/thread/802155) for context.
 
-Automatically serialize and deserialize structs using compile-time reflection. No hand-written `to_json()` or `from_json()` methods needed.
+## Architecture
 
-```mojo
-from json import serialize_json, deserialize_json
-
-@fieldwise_init
-struct Person(Defaultable, Movable):
-    var name: String
-    var age: Int
-    var active: Bool
-    def __init__(out self):
-        self.name = ""
-        self.age = 0
-        self.active = False
-
-# Serialize: one function, zero boilerplate
-var json = serialize_json(Person(name="Alice", age=30, active=True))
-# {"name":"Alice","age":30,"active":true}
-
-# Deserialize: just specify the type
-var person = deserialize_json[Person](json)
-print(person.name)  # Alice
-
-# Pretty print
-print(serialize_json[pretty=True](person))
-
-# GPU-accelerated parsing, CPU struct extraction
-var fast = deserialize_json[Person, target="gpu"](json)
-
-# Non-raising variant (returns Optional)
-from json import try_deserialize_json
-var maybe = try_deserialize_json[Person]('{"bad json')  # None
+```
+json.parser          loads / load: dispatch on target= and format=
+json.serialize       dumps / dump
+json.document        Tape-backed Document (single source of truth)
+json.value           Value view over Document tape
+json.cpu             Two-pass CPU parser (stage 1 SIMD scan, stage 2 tape emit) and simdjson FFI
+json.gpu             GPU kernels (fused structural scan), stream compaction, tape adapter
+json.reflection      Compile-time reflection serde
+json.lazy            LazyValue (on-demand parsing of substrings)
+json.streaming       Streaming parser for files larger than memory
+json.patch           JSON Patch (RFC 6902), Merge Patch (RFC 7396)
+json.jsonpath        JSONPath (RFC 9535)
+json.schema          JSON Schema validation
+json.ndjson          NDJSON
 ```
 
-### Supported Field Types
-
-| Category | Types |
-|----------|-------|
-| Scalars | `Int`, `Int64`, `Bool`, `Float64`, `Float32`, `String` |
-| Containers | `List[T]`, `Optional[T]` (where T is a scalar) |
-| Nested | Any struct that is `Defaultable & Movable` |
-| Raw JSON | `Value` (pass-through, no conversion) |
-
-### Custom Serialization
-
-Override reflection behavior for specific types:
-
-```mojo
-from json import JsonSerializable, JsonDeserializable
-
-struct Color(JsonSerializable, Defaultable, Movable):
-    var r: Int
-    var g: Int
-    var b: Int
-
-    def to_json_value(self) raises -> Value:
-        """Serialize as "rgb(r,g,b)" instead of {"r":...,"g":...,"b":...}."""
-        ...
-
-struct RGBArray(JsonDeserializable, Defaultable, Movable):
-    var r: Int
-    var g: Int
-    var b: Int
-
-    @staticmethod
-    def from_json_value(json: Value) raises -> Self:
-        """Deserialize from JSON array [r, g, b] instead of object."""
-        ...
-```
-
-Full API reference: [ehsanmok.github.io/json](https://ehsanmok.github.io/json/)
+Every backend (Mojo native CPU, simdjson FFI, GPU) emits the same `Document` tape, so `Value` access, mutation, JSONPath, JSON Patch, and Schema validation see one DOM regardless of how the bytes arrived. Full request lifecycle and tape layout in [`docs/architecture.md`](./docs/architecture.md).
 
 ## Examples
 
-Examples are organised by progression -- start in `basic/`, move to
-`intermediate/` when you need typed serde / JSONPath / Schema / Patch,
-and dip into `advanced/` for lazy and GPU paths. See
-[examples/README.md](./examples/README.md) for the full guided tour.
-
 ```bash
-pixi run examples                                  # run every tier
+pixi run examples                                  # every tier
 pixi run example-parsing                           # one example by name
-pixi run mojo -I . examples/basic/parsing.mojo     # or invoke mojo directly
+pixi run mojo -I . examples/basic/parsing.mojo     # raw mojo invoke
 ```
 
-### basic/ -- first ten lines of code
+| Tier | File | What it covers |
+|---|---|---|
+| basic | [`parsing.mojo`](./examples/basic/parsing.mojo) | `loads` / `dumps`, scalars and nested types |
+| basic | [`file_io.mojo`](./examples/basic/file_io.mojo) | `load` / `dump` for JSON files |
+| basic | [`value_types.mojo`](./examples/basic/value_types.mojo) | `Value` API: `is_*`, `*_value`, `array_count`, `object_keys` |
+| basic | [`error_handling.mojo`](./examples/basic/error_handling.mojo) | `try` / `except` patterns and recovery |
+| intermediate | [`reflection_serde.mojo`](./examples/intermediate/reflection_serde.mojo) | Zero-boilerplate struct serde via reflection |
+| intermediate | [`struct_serde.mojo`](./examples/intermediate/struct_serde.mojo) | Manual `Serializable` / `Deserializable` traits |
+| intermediate | [`ndjson.mojo`](./examples/intermediate/ndjson.mojo) | NDJSON parsing and serialization |
+| intermediate | [`jsonpath.mojo`](./examples/intermediate/jsonpath.mojo) | RFC 9535 JSONPath queries |
+| intermediate | [`schema_validation.mojo`](./examples/intermediate/schema_validation.mojo) | JSON Schema validation |
+| intermediate | [`json_patch.mojo`](./examples/intermediate/json_patch.mojo) | RFC 6902 JSON Patch and RFC 7396 Merge Patch |
+| advanced | [`lazy_parsing.mojo`](./examples/advanced/lazy_parsing.mojo) | On-demand parsing for huge documents |
+| advanced | [`gpu_parsing.mojo`](./examples/advanced/gpu_parsing.mojo) | GPU pipeline (NVIDIA, AMD, Apple Metal) |
 
-| Example | Description |
-|---------|-------------|
-| [basic/parsing](./examples/basic/parsing.mojo)               | Parse, serialize, type handling |
-| [basic/file_io](./examples/basic/file_io.mojo)               | Read/write JSON files |
-| [basic/value_types](./examples/basic/value_types.mojo)       | Type checking, value extraction |
-| [basic/error_handling](./examples/basic/error_handling.mojo) | `try` / `except` patterns and recovery |
+The full guided tour is in [`examples/README.md`](./examples/README.md).
 
-### intermediate/ -- real-world feature usage
-
-| Example | Description |
-|---------|-------------|
-| [intermediate/reflection_serde](./examples/intermediate/reflection_serde.mojo) | Zero-boilerplate struct serde via reflection |
-| [intermediate/struct_serde](./examples/intermediate/struct_serde.mojo)         | Manual `Serializable` / `Deserializable` traits |
-| [intermediate/ndjson](./examples/intermediate/ndjson.mojo)                     | NDJSON parsing & streaming |
-| [intermediate/jsonpath](./examples/intermediate/jsonpath.mojo)                 | RFC 9535 JSONPath queries |
-| [intermediate/schema_validation](./examples/intermediate/schema_validation.mojo) | JSON Schema validation |
-| [intermediate/json_patch](./examples/intermediate/json_patch.mojo)             | JSON Patch (RFC 6902) & Merge Patch (RFC 7396) |
-
-### advanced/ -- perf-focused
-
-| Example | Description |
-|---------|-------------|
-| [advanced/lazy_parsing](./examples/advanced/lazy_parsing.mojo) | On-demand lazy parsing for large documents |
-| [advanced/gpu_parsing](./examples/advanced/gpu_parsing.mojo)   | GPU-accelerated parsing (Apple-Silicon-aware) |
-
-## Development
+## Develop
 
 ```bash
 git clone https://github.com/ehsanmok/json.git && cd json
-pixi install                 # lean default env (mojo, simdjson, gxx, sysroot)
-pixi run tests-cpu           # or: tests-gpu / tests-e2e / tests-e2e-gpu
-pixi run bench-gpu           # optional; builds and runs the GPU benchmark
+pixi install                  # default env: tests, examples, library
+pixi install -e dev           # adds mojodoc, pre-commit, dataset downloader
 ```
 
-### Pixi environments
+The project uses three pixi environments, layered:
 
-The project layers three environments; pick the one that matches the
-job you're doing.
+| Env | Adds | What it unlocks |
+|---|---|---|
+| `default` | nothing | `tests-cpu`, `tests-gpu`, `tests-e2e`, `examples`, `format-check` |
+| `dev` | mojodoc, pre-commit, gdown, sysroot pin, gxx | `format`, `docs`, `bench-cpu`, `bench-gpu`, `tests-asan`, `download-*` |
+| `fuzz` | mozz on top of `dev` | `fuzz-loads`, `fuzz-simdjson`, `fuzz-value-access`, `fuzz-jsonpath`, `fuzz-ndjson`, `fuzz-all` |
 
-| Env       | What's in it                                                | When to use it                                                                |
-|-----------|-------------------------------------------------------------|-------------------------------------------------------------------------------|
-| `default` | mojo, simdjson, gxx, sysroot (Linux)                        | Run the library, run tests, run examples. End users stop here.                |
-| `dev`     | `default` + python, gdown, pre-commit, mojodoc, sysroot pin | Format, build docs, build benchmark binaries, AOT sanitizer builds, datasets. |
-| `fuzz`    | `dev` + mozz                                                | Run mozz fuzz harnesses against the FFI / parser / access surfaces.           |
+Common tasks (run with `pixi run [-e <env>] <task>`):
 
-Switch envs by passing `-e <name>` to `pixi run`, or enter a shell with
-`pixi shell -e <name>`. Tasks defined only in a non-default env auto-route
-when there is no ambiguity, but explicit `-e` is always safe.
+| Task | Env | What it does |
+|---|---|---|
+| `tests` | default | Full unit + integration suite plus every example under [`examples/`](./examples/) |
+| `tests-cpu` / `tests-gpu` / `tests-e2e` | default | Tier-specific suites |
+| `tests-asan` | dev | LLVM AddressSanitizer over the FFI and tape boundaries (Linux) |
+| `format-check` / `format` | default / dev | `mojo format` over `json`, `tests`, `benchmark/mojo` |
+| `docs` / `docs-build` | dev | mojodoc-rendered package docstring |
+| `bench-cpu` / `bench-gpu` / `bench-gpu-apple` | dev | Reproducible benches |
+| `fuzz-all` | fuzz | Every harness back-to-back |
 
-### Common dev tasks
+The full task list, including every per-example and per-fuzz target, is in [`pixi.toml`](./pixi.toml).
 
-```bash
-pixi run -e dev format          # mojo format + pre-commit hook install
-pixi run -e dev format-check    # used by CI
-pixi run -e dev docs            # mojodoc + open in browser
-pixi run -e dev docs-build      # build into target/doc (used by Pages workflow)
-pixi run -e dev download-twitter-large  # gdown cuJSON benchmark datasets
-```
+### Sanitizer harness
 
-### Sanitizer testing (ASan)
+`pixi run -e dev tests-asan` AOT-builds the FFI- and lifetime-heavy slice of the suite with `--sanitize address` and runs each binary in isolation. The intent is to catch use-after-free, OOB, and lifetime regressions on the simdjson FFI shim, the tape-backed `Document` / `Value` view, and the COW mutation path before they hit production.
 
-A curated, FFI- and lifetime-heavy slice of the test suite is
-exercised under LLVM AddressSanitizer to catch use-after-free,
-out-of-bounds, and lifetime regressions in the simdjson FFI shim, the
-tape-backed `Document` / `Value` view, and the COW mutation path.
-Driven by [`tools/run_sanitizer_tests.sh`](./tools/run_sanitizer_tests.sh).
+> **macOS note.** Mojo's bundled libasan looks for `__asan_version_mismatch_check_v8`; system clang on Apple Silicon ships `__asan_version_mismatch_check_apple_clang_1700`. The harness detects the mismatch and skips with a clear message, so a dev-box `pixi run tests-asan` exits 0. Linux CI runs the full harness end-to-end.
 
-```bash
-pixi run -e dev tests-asan      # AOT-build with --sanitize address, run, fail-fast
-pixi run -e dev tests-asan tests/test_value.mojo   # one file
-```
+### Fuzz harnesses
 
-> **macOS note.** Mojo's bundled libasan expects
-> `__asan_version_mismatch_check_v8`; the system clang on Apple
-> Silicon ships `__asan_version_mismatch_check_apple_clang_1700`. The
-> harness detects this and skips cleanly with a clear message, so a
-> dev-box `pixi run tests-asan` doesn't fail. Linux CI runs the full
-> harness end-to-end.
+Five mozz harnesses live under [`fuzz/`](./fuzz/):
 
-### Fuzz testing (mozz)
+- `fuzz-loads`: default Mojo two-pass parser, with a `parse -> dumps -> parse` idempotence property.
+- `fuzz-simdjson`: simdjson FFI boundary, with a differential property that simdjson and the native Mojo parser must agree on canonical `dumps` output when both succeed.
+- `fuzz-value-access`: `Value` access API and COW mutation.
+- `fuzz-jsonpath`: RFC 9535 JSONPath engine.
+- `fuzz-ndjson`: `loads[format='ndjson']` line splitter.
 
-Mozz harnesses live in [`fuzz/`](./fuzz/) and exercise:
+Crashes land under `.mozz_crashes/<harness>/`; copy regressions into `fuzz/corpus/<harness>/` to lock them in.
 
-- `fuzz-loads` -- the default Mojo two-pass parser, with a
-  parse -> dumps -> parse idempotence property.
-- `fuzz-simdjson` -- the simdjson FFI boundary
-  (`OwnedDLHandle` + `external_call`), with a differential property
-  that the simdjson and Mojo native parsers must agree on canonical
-  `dumps` output when both succeed.
-- `fuzz-value-access` -- the `Value` access API + COW mutation.
-- `fuzz-jsonpath` -- the RFC 9535 JSONPath engine.
-- `fuzz-ndjson` -- the `loads[format='ndjson']` line splitter.
+## Further reading
 
-```bash
-pixi run -e fuzz fuzz-simdjson  # 200k iters; locks crash repros under .mozz_crashes/
-pixi run -e fuzz fuzz-all       # run every harness back-to-back
-```
-
-The `fuzz/corpus/<harness>/` directory is gitignored and populated at
-runtime; copy interesting crashes there manually to lock in
-regressions.
-
-### GPU on Apple Silicon
-
-Mojo's Metal backend currently rejects the raw-pointer kernels the
-GPU pipeline relies on (`Metal Compiler failed to compile metallib`).
-The library handles this honestly: `loads[target='gpu']` raises by
-default on Apple Silicon, and recompiling with
-`-D JSON_GPU_ALLOW_APPLE_FALLBACK=1` opts back into the silent CPU
-fallback. The pixi tasks set this flag for the cases where it makes
-sense:
-
-| Task                  | Apple Silicon behaviour                                                         |
-|-----------------------|---------------------------------------------------------------------------------|
-| `tests-gpu`           | Builds + runs (21 / 21 pass under the fallback flag)                            |
-| `tests-e2e-gpu`       | Builds + runs (38 / 38 pass under the fallback flag)                            |
-| `example-gpu`         | Runs end-to-end under the fallback flag                                         |
-| `bench-gpu`           | Skips with a clean "Metal lacks raw-pointer kernel support" message, exits 0    |
-
-On Linux + NVIDIA / AMD the flag is harmless and the real GPU path is
-taken before the fallback gate.
-
-`pixi run <task>` without `-e` auto-routes dev / fuzz tasks to the
-matching env when the task is unambiguous. End users consuming the
-library as a package never need the `dev` or `fuzz` features.
-
-Further documentation:
-
-- [Architecture](./docs/architecture.md): CPU/GPU backend design
-- [Performance](./docs/performance.md): optimization deep dive
-- [Benchmarks](./benchmark/README.md): reproducible benchmarks
-- [Examples guided tour](./examples/README.md): basic / intermediate / advanced
+- [`docs/api.md`](./docs/api.md): full API reference.
+- [`docs/architecture.md`](./docs/architecture.md): CPU and GPU backend design, tape layout, `Value` semantics.
+- [`docs/performance.md`](./docs/performance.md): benchmark methodology, optimisation deep-dive, what's left to close the simdjson gap.
+- [`benchmark/README.md`](./benchmark/README.md): reproducible benchmark setup.
+- [`examples/README.md`](./examples/README.md): guided tour of basic, intermediate, advanced examples.
 
 ## License
 

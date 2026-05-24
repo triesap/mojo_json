@@ -20,7 +20,7 @@ var logs = load[format="ndjson"]("events.ndjson")  # List[Value]
 var big = load[target="gpu"]("large.json")
 ```
 
-## `json.prelude` -- one-line import for everyday code
+## `json.prelude`: one-line import for everyday code
 
 `json.prelude` re-exports the names a typical module reaches for, so
 the standard import block becomes a single line:
@@ -43,7 +43,7 @@ The exact set of re-exports is intentionally small:
 | `serialize_json`, `serialize_value`, `deserialize_json`, `deserialize_value`,     |                     |
 | `try_deserialize_json`, `JsonSerializable`, `JsonDeserializable`                  | `json.reflection`   |
 
-Domain-specific surfaces are deliberately **not** re-exported -- the
+Domain-specific surfaces are deliberately **not** re-exported. The
 prelude stays small enough that the import block of a real module
 still documents which features it actually uses. Import directly:
 
@@ -336,19 +336,22 @@ except e:
     # JSON parse error at line 1, column 13: ...
 ```
 
-In v0.2, `loads[target='gpu']` raises an explicit error on Apple
-Silicon (Metal backend lacks raw-pointer kernel support); recompile
-with `-D JSON_GPU_ALLOW_APPLE_FALLBACK=1` to opt into the legacy
-silent CPU fallback.
-
 ## GPU Parsing
 
-Recommended for files >100MB. Works on NVIDIA (CUDA 7.0+), AMD
-(ROCm 6+); Apple Silicon currently raises (see above).
+Recommended for files larger than 100 MB. Runs natively on NVIDIA
+(CUDA 7.0+), AMD (ROCm 6+), and Apple Silicon (Metal). The runtime
+picks the backend based on what's present.
 
 ```mojo
 var data = loads[target="gpu"](large_json)
 ```
+
+> **Apple Metal users on Xcode 26.x.** If the build errors with
+> `Metal Compiler failed to compile metallib`, run
+> `xcodebuild -downloadComponent MetalToolchain` once to register
+> the toolchain. See the
+> [Apple developer thread](https://developer.apple.com/forums/thread/802155)
+> for context.
 
 ## NDJSON
 
