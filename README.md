@@ -73,7 +73,7 @@ Supported reflection field types include `Int`, `Int64`, `Bool`, `Float64`, `Flo
 | Platform | Throughput | Pipeline |
 |---|---:|---|
 | AMD MI355X | 13 GB/s | lean (single-shot) |
-| NVIDIA B200 | ~6.5 GB/s | lean (single-shot, pinned wall-clock) |
+| NVIDIA B200 | 6.5 GB/s | lean (single-shot, pinned wall-clock) |
 | Apple M3 Pro | 3.1 GB/s | lean Metal (chunked at 64 MB) |
 
 NVIDIA / AMD / Apple all run the same lean pipeline -- a single fused kernel + positions-only stream compaction. The CPU tape adapter consumes only `gpu_result.structural` and walks the byte stream once to apply the in-string escape state machine, so no `pair_pos` array or popcount + hierarchical prefix-sum cascade is needed. GPU is only beneficial for files >100 MB on discrete cards.
