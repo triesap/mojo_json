@@ -553,7 +553,7 @@ def test_custom_deserialize() raises:
 
 
 # ===================================================================
-# Phase F combinator types: Dict[String, T], nested lists, Optional<->List
+# Combinator types: Dict[String, T], nested lists, Optional<->List.
 # ===================================================================
 
 
@@ -750,7 +750,7 @@ def main() raises:
     test_custom_deserialize()
     print()
 
-    print("Combinator types (Phase F):")
+    print("Combinator types:")
     test_serialize_dict_string_int()
     test_serialize_dict_string_string()
     test_serialize_list_optional_int()

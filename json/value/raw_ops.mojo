@@ -5,10 +5,10 @@
 # do NOT depend on the `Value` type, which keeps the import graph
 # acyclic across the `value/` package.
 #
-# Phase B replaces the mutation surgery (`_update_*`, `_add_*`,
-# `_append_*`) with copy-on-write through `OwnedValue`, leaving only
-# the read-side `_extract_*` helpers used for `raw_json()` round-trip
-# and for `LazyValue`.
+# Mutation surgery (`_update_*`, `_add_*`, `_append_*`) is not
+# implemented here -- mutation uses copy-on-write through `OwnedValue`
+# in `value/owned.mojo`. This module is the read-side `_extract_*`
+# helpers used for `raw_json()` round-trip and for `LazyValue`.
 
 from std.collections import List
 
@@ -357,8 +357,8 @@ def _extract_object_keys(raw: String) -> List[String]:
 
 
 # ---------------------------------------------------------------------------
-# Mutation helpers were removed in v0.2 Phase B. Use `OwnedValue` and
-# `_set_at_pointer` in `value/owned.mojo` for any mutation flow.
+# Mutation flows go through `OwnedValue` and `_set_at_pointer` in
+# `value/owned.mojo`; this module is read-only string surgery only.
 # ---------------------------------------------------------------------------
 
 

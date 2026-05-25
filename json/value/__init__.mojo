@@ -1,14 +1,15 @@
 # json - `Value` package
 #
-# This package replaces the v0.1 monolithic `json/value.mojo`. The split
-# isolates pure string utilities (`raw_ops.mojo`) from the type itself
-# (`value.mojo`) so subsequent phases can land focused changes:
-#   - Phase B: copy-on-write mutation through `OwnedValue` (owned.mojo).
-#   - Phase C: tape-backed read path via `Document` (json/document.mojo).
+# The split isolates pure string utilities (`raw_ops.mojo`) from the
+# type itself (`value.mojo`):
+#   - `value.mojo`     : tape-backed `Value` view over a `Document`.
+#   - `owned.mojo`     : copy-on-write `OwnedValue` mutation tree.
+#   - `raw_ops.mojo`   : pure JSON byte-level helpers shared with the
+#       lazy parser.
 #
-# Public re-exports below match the v0.1 surface so callers
-# (patch, jsonpath, schema, serialize, reflection, lazy) build
-# unchanged.
+# Public re-exports below are the cross-module surface that other
+# subpackages (patch, jsonpath, schema, serialize, reflection, lazy)
+# build against.
 
 from .value import (
     Value,

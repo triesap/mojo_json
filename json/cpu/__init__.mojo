@@ -1,9 +1,9 @@
 # json CPU backends.
 #
-# v0.2 ships two CPU paths, both producing tape-backed `Value` views:
+# Two CPU paths, both producing tape-backed `Value` views:
 #   - `parse_cpu_native_tape` (default): two-pass stage 1 + stage 2
-#       walker that emits a `Document` and wraps the root as a `Value`
-#       view. Stage 1 has scalar (`stage1_scalar`) and SIMD
+#       walker that emits a `Document` and wraps the root as a
+#       `Value` view. Stage 1 has scalar (`stage1_scalar`) and SIMD
 #       (`stage1`) implementations; both are byte-identical, enforced
 #       by `tests/test_stage1_equivalence.mojo`. Default is SIMD
 #       (1.5x to 2.2x faster on the benchmark corpora); opt into the
@@ -11,12 +11,6 @@
 #   - simdjson FFI: optional C++ backend, exposed via `SimdjsonFFI`
 #       and selected with `loads[target='cpu-simdjson']`. The FFI
 #       output is translated into the same tape representation.
-#
-# The pre-v0.2 `parse_mojo` / `parse_simd` entry points (and their
-# `MojoJSONParser` / `FastParser` structs) were deleted in v0.2-E.
-# The v0.1 lazy `parse_cpu_native` / `parse_two_pass` entry points
-# were deleted alongside the lazy `Value` representation; everything
-# that used to consume them has been migrated to the tape view.
 
 # Common type tags shared with the simdjson FFI bindings.
 from .types import (

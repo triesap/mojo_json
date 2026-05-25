@@ -511,8 +511,9 @@ def _value_to_json(v: Value) -> String:
 
     Used by `Value.set` / `Value.append` to render the new value into
     JSON text before splicing it into the raw object/array string.
-    Phase B replaces this with a structured COW path. The full-featured
-    serializer (indent, escape options, etc.) is `serialize.dumps`.
+    The full-featured serializer (indent, escape options, etc.) is
+    `serialize.dumps`; mutation uses the structured copy-on-write
+    path in `value/owned.mojo`.
     """
     if v.is_null():
         return "null"

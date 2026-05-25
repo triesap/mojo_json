@@ -1,9 +1,10 @@
 # json - Tape-backed Document representation.
 #
-# This module introduces the v0.2 storage layout that arrays and objects will
-# eventually be read from in O(1) per step. In Phase A the type is added and
-# tested independently; later phases (B copy-on-write, C SIMD parser, D GPU
-# adapter) progressively wire reads, mutations, and parsers through it.
+# A `Document` is a single packed buffer of 64-bit tape entries plus a
+# few side pools. Arrays and objects are read from the tape in O(1)
+# per step: each container's header carries a `child_start_idx` that
+# points backwards into a contiguous run of children's headers, so a
+# linear walk over the tape is enough to traverse the entire DOM.
 #
 # Tape entry layout (64 bits)
 # ---------------------------
@@ -117,7 +118,8 @@ struct Document(Copyable, Movable):
 
     A `Document` is the storage unit produced by parsers. A `Value` view
     references a tape entry inside a `Document` by index; when a `Value`
-    is mutated, the document is materialized into an owned tree (Phase B).
+    is mutated, the document is materialized into an owned tree
+    (`OwnedValue` in `value/owned.mojo`).
 
     Side pools:
       - `key_pool` stores unescaped object keys. Object KEY entries store a
@@ -128,7 +130,7 @@ struct Document(Copyable, Movable):
         as STRING (offset, length) entries into `input`.
       - `float_pool` stores `Float64` values, since 64-bit IEEE 754 doesn't
         fit in 60 bits.
-      - `int_pool` is reserved for spilled large integers; in Phase A all
+      - `int_pool` is reserved for spilled large integers; for now all
         integers are inlined as 60-bit signed payloads.
     """
 

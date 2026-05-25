@@ -2,9 +2,8 @@
 #
 # These are the building blocks that turn the per-chunk escape-state
 # machine and "is byte i inside a JSON string?" question into pure
-# bit-twiddling on 64-bit masks. Both questions used to be a
-# byte-by-byte scalar walk in Phase 1/2; here we make them a fixed
-# number of ALU ops independent of chunk content.
+# bit-twiddling on 64-bit masks: a fixed number of ALU ops
+# independent of chunk content instead of a byte-by-byte scalar walk.
 #
 # prefix_xor64 ---------------------------------------------------------------
 #

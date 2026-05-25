@@ -1,8 +1,8 @@
 # Scalar stage 1: byte-by-byte structural-index builder.
 #
-# This is the v0.2 truth oracle for stage 1. It walks the input one byte at
-# a time, tracking string-vs-not-string state and escape state, and emits
-# the offset of every structural character outside strings:
+# This is the truth oracle for stage 1. It walks the input one byte
+# at a time, tracking string-vs-not-string state and escape state,
+# and emits the offset of every structural character outside strings:
 #
 #     {  }  [  ]  :  ,  "
 #

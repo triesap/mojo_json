@@ -1,4 +1,4 @@
-# Tests for v0.2 Phase B: copy-on-write mutation via OwnedValue.
+# Tests for copy-on-write mutation via OwnedValue.
 #
 # These tests pin down the mutation contract:
 #   1. `Value.set` / `Value.append` mutate in place and the change is
@@ -7,12 +7,11 @@
 #      previously parsed -- it does not silently drop sibling keys or
 #      reorder them within an object.
 #   3. `Value.set_at(pointer, value)` propagates a mutation through the
-#      full parent chain. This was the silent-bug class in v0.1 where
-#      `doc["a"]["b"].set("c", value)` lost the change because
-#      `__getitem__` returned a fresh copy.
-#   4. The pre-Phase-B convenience pattern used by `json/patch.mojo`
-#      (read parent, mutate, write parent back) keeps working --
-#      no caller of the existing public API regresses.
+#      full parent chain, so `doc["a"]["b"].set("c", value)` is
+#      visible from `doc` afterwards even though `__getitem__`
+#      returns a fresh view.
+#   4. The patch convenience pattern used by `json/patch.mojo`
+#      (read parent, mutate, write parent back) keeps working.
 
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
@@ -20,7 +19,7 @@ from json import loads, Value, Null
 
 
 # ---------------------------------------------------------------------------
-# Top-level mutation -- the v0.1 surface that must keep working.
+# Top-level mutation.
 # ---------------------------------------------------------------------------
 
 
@@ -158,8 +157,7 @@ def test_append_complex_value() raises:
 
 
 # ---------------------------------------------------------------------------
-# set_at(pointer, value) -- the v0.2 entry point for nested mutation.
-# This is what closes the silent-bug gap from v0.1.
+# set_at(pointer, value) -- nested mutation entry point.
 # ---------------------------------------------------------------------------
 
 

@@ -6,30 +6,30 @@
 - **CPU fast path:** pure-Mojo two-pass parser, ~1.4 GB/s, zero FFI
 - **JSONPath, Schema, Patch:** RFC 6901, RFC 6902, RFC 7396
 
-See [docs/api.md](docs/api.md) for the full API reference and usage
-examples. The block comment below is the short orientation; for
-anything beyond five lines of code please go to the API doc.
+See [the API reference](https://ehsanmok.github.io/json/) for
+complete documentation. The block comment below is the short
+orientation; for anything beyond five lines of code please go to
+the API doc.
 
 ```mojo
 from json import loads, dumps, load, dump
 
 var data = loads('{"name": "Alice"}')         # default fast Mojo CPU
 var fast = loads[target="cpu-simdjson"](s)    # simdjson FFI
-var big  = load[target="gpu"]("huge.json")    # GPU (non-Apple)
+var big  = load[target="gpu"]("huge.json")    # GPU
 
 print(dumps(data, indent="  "))
 ```
 
-v0.2 changes worth knowing:
+Notes:
 - `Value` is a view over a tape-backed `Document`; mutation is
   copy-on-write, so nested `set` / `append` propagates correctly.
 - The default CPU parser is the two-pass stage 1 + stage 2 walker
-  (`json.cpu.parse_cpu_native_tape`); `parse_mojo` / `parse_simd` and
-  the `MojoJSONParser` / `FastParser` types are gone.
-- `loads[target='gpu']` runs natively on NVIDIA, AMD, and Apple Metal
-  (since v0.2.0 -- `gpu/kernels.mojo` emits a raw structural bitmap
-  and `gpu/tape_adapter.mojo` filters it CPU-side, which sidesteps the
-  cross-chunk escape-bitmap quirks Apple's prior in-string mask had).
+  (`json.cpu.parse_cpu_native_tape`).
+- `loads[target='gpu']` runs natively on NVIDIA, AMD, and Apple
+  Metal under one lean pipeline; `gpu/kernels.mojo` emits a raw
+  structural bitmap and `gpu/tape_adapter.mojo` applies the
+  in-string filter on the CPU side.
 - Typed NDJSON file load: `load[format='ndjson'](path) -> List[Value]`.
 - Configured parsing / serialisation use the two-arg overloads:
   `loads(s, config)` and `dumps(v, config)`.

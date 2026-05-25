@@ -77,9 +77,9 @@ build = "bash json/cpu/simdjson_ffi/build.sh"
 
 # Tests (includes examples). Examples are organised under
 # basic/ intermediate/ advanced/ -- see examples/README.md.
-# `loads[target='gpu']` runs natively on NVIDIA, AMD, and Apple Metal
-# (since v0.2.0 -- see gpu/kernels.mojo + gpu/tape_adapter.mojo for
-# how Apple's escape-bitmap quirks are handled CPU-side).
+# `loads[target='gpu']` runs natively on NVIDIA, AMD, and Apple Metal;
+# `gpu/kernels.mojo` emits the raw structural bitmap and
+# `gpu/tape_adapter.mojo` applies the in-string filter CPU-side.
 tests = "mojo -I . tests/test_value.mojo && mojo -I . tests/test_parser.mojo && mojo -I . tests/test_serialize.mojo && mojo -I . tests/test_serde.mojo && mojo -I . tests/test_reflection.mojo && mojo -I . tests/test_e2e.mojo && mojo -I . tests/test_gpu.mojo && mojo -I . examples/basic/parsing.mojo && mojo -I . examples/basic/file_io.mojo && mojo -I . examples/basic/value_types.mojo && mojo -I . examples/basic/error_handling.mojo && mojo -I . examples/intermediate/reflection_serde.mojo && mojo -I . examples/intermediate/struct_serde.mojo && mojo -I . examples/intermediate/ndjson.mojo && mojo -I . examples/intermediate/jsonpath.mojo && mojo -I . examples/intermediate/schema_validation.mojo && mojo -I . examples/intermediate/json_patch.mojo && mojo -I . examples/advanced/lazy_parsing.mojo && mojo -I . examples/advanced/gpu_parsing.mojo"
 # tests-cpu: full CPU suite. `loads(target='cpu')` routes through the
 # tape-backed Value view, so this is also the tape conformance suite.
@@ -133,12 +133,16 @@ download-wiki-large = "gdown -O benchmark/datasets/wiki_large_record.json 1bXdzh
 # cuJSON (optional) - NVIDIA benchmarks only
 build-cujson = "bash -c 'cd benchmark && if [ ! -d cuJSON ]; then echo \"Error: cuJSON not found. Download it first:\\n  cd benchmark && git clone https://github.com/AutomataLab/cuJSON.git\" && exit 1; fi && mkdir -p cuJSON/build && nvcc -O3 -w -std=c++17 -arch=sm_100 -o cuJSON/build/cujson_benchmark cuJSON/paper_reproduced/src/cuJSON-standardjson.cu'"
 
-# Build benchmark binaries (calls `mojo build` -> needs sysroot >= 2.34)
-build-bench-cpu = { cmd = "mkdir -p benchmark/build && mojo build -I . -o benchmark/build/bench_cpu benchmark/mojo/bench_cpu.mojo", depends-on = ["build"] }
+# Build benchmark binaries (calls `mojo build` -> needs sysroot >= 2.34).
+# `-D ASSERT=none` strips the Mojo stdlib safety asserts that the
+# default `ASSERT=safe` build keeps in the binary -- this is the
+# apples-to-apples posture vs simdjson C++'s `-O3` build and matches
+# the production-build convention used by other Mojo libraries.
+build-bench-cpu = { cmd = "mkdir -p benchmark/build && mojo build -D ASSERT=none -I . -o benchmark/build/bench_cpu benchmark/mojo/bench_cpu.mojo", depends-on = ["build"] }
 # bench_gpu builds on every accelerator backend (NVIDIA, AMD, Apple
 # Metal). The Apple Metal toolchain ships with Xcode (install via
 # `xcodebuild -downloadComponent MetalToolchain` if missing).
-build-bench-gpu = { cmd = "bash -c 'mkdir -p benchmark/build && mojo build -I . -o benchmark/build/bench_gpu benchmark/mojo/bench_gpu.mojo'", depends-on = ["build"] }
+build-bench-gpu = { cmd = "bash -c 'mkdir -p benchmark/build && mojo build -D ASSERT=none -I . -o benchmark/build/bench_gpu benchmark/mojo/bench_gpu.mojo'", depends-on = ["build"] }
 build-bench-simdjson = { cmd = "bash -c 'mkdir -p benchmark/build && CXX=$(if [[ $(uname) == Darwin ]]; then echo clang++; else echo g++; fi) && $CXX -O3 -std=c++17 -o benchmark/build/bench_simdjson benchmark/cpp/bench_simdjson.cpp -I$CONDA_PREFIX/include -L$CONDA_PREFIX/lib -lsimdjson -Wl,-rpath,$CONDA_PREFIX/lib'", depends-on = ["build"] }
 
 # Benchmarks - pass file path and flags as arguments, path defaults to twitter.json
@@ -151,7 +155,7 @@ bench-gpu = { cmd = "bash -c 'if [ \"$#\" -eq 0 ]; then benchmark/build/bench_gp
 # file sizes (twitter, citm, twitter_large_record) and reports best-of-N
 # throughput per file. The Apple chunked path is exercised here, so
 # this is the script to use for refreshing the README's Apple M3 Pro row.
-bench-gpu-apple = { cmd = "bash -c 'if [ \"$#\" -eq 0 ]; then mojo -I . benchmark/mojo/bench_gpu_apple.mojo benchmark/datasets/twitter.json benchmark/datasets/citm_catalog.json; else mojo -I . benchmark/mojo/bench_gpu_apple.mojo \"$@\"; fi' _" }
+bench-gpu-apple = { cmd = "bash -c 'if [ \"$#\" -eq 0 ]; then mojo -D ASSERT=none -I . benchmark/mojo/bench_gpu_apple.mojo benchmark/datasets/twitter.json benchmark/datasets/citm_catalog.json; else mojo -D ASSERT=none -I . benchmark/mojo/bench_gpu_apple.mojo \"$@\"; fi' _" }
 bench-gpu-all = { cmd = "bash -c 'for i in 1 2 3; do for f in benchmark/datasets/*_large_*.json; do echo \"=== Run $i: $f ===\"; benchmark/build/bench_gpu \"$f\"; done; done'", depends-on = ["build-bench-gpu"] }
 
 # GPU benchmark vs cuJSON (NVIDIA only, requires manual cuJSON download)

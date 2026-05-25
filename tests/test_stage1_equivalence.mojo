@@ -1,4 +1,4 @@
-# Equivalence tests for the v0.2 stage 1 implementations.
+# Equivalence tests for the two stage 1 implementations.
 #
 # `parse_structural_scalar` (oracle) and `parse_structural_simd` MUST
 # produce byte-for-byte identical structural-index output. These tests

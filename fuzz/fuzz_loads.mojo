@@ -72,7 +72,7 @@ def main() raises:
     seeds.append(_bytes('{"k":"v"}'))
     seeds.append(_bytes('{"a":[1,{"b":[true,null,false]}]}'))
 
-    # Edge cases the v0.2 stage 2 validator now rejects
+    # Edge cases the stage 2 validator rejects.
     seeds.append(_bytes("007"))
     seeds.append(_bytes("[1,,2]"))
     seeds.append(_bytes('{"k" "v"}'))

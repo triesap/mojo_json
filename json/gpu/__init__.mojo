@@ -7,5 +7,5 @@
 
 from .parser import parse_json_gpu, parse_json_gpu_from_pinned
 from .kernels import BLOCK_SIZE_OPT, fused_json_kernel
-from .stream_compact import extract_positions_gpu
+from .stream_compact import extract_positions_gpu_lean
 from .tape_adapter import parse_gpu_to_value

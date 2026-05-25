@@ -2,25 +2,28 @@
 
 This document explains why json is faster than existing parsers and the key optimizations that make it possible.
 
-## GPU: 2x Faster than cuJSON
+## GPU: lean pipeline across NVIDIA / AMD / Apple
 
-On NVIDIA B200 with 804MB `twitter_large_record.json`:
+On NVIDIA B200 with 804 MB `twitter_large_record.json` (same lean
+pipeline runs on AMD MI355X and Apple Metal):
 
-| Parser | Throughput | Time | Speedup |
-|--------|------------|------|---------|
+| Parser | Throughput | Time | Notes |
+|--------|------------|------|---|
 | cuJSON (CUDA C++) | 3.6 GB/s | 236 ms | baseline |
-| **json GPU** | **7.0 GB/s** | **121 ms** | **2.0x** |
+| **json GPU (pinned wall-clock)** | **~6.5 GB/s** | **~130 ms** | what `bench-gpu` reports |
 
-*Based on warmed-up runs. Pinned memory path (comparable scope to cuJSON).*
+*Based on warmed-up runs (3 + 100). Reproduce with `pixi run -e dev
+bench-gpu benchmark/datasets/twitter_large_record.json`; pass
+`--debug-timing` for the per-phase breakdown.*
 
 ## Key Optimizations
 
 | Optimization | Impact | Description |
 |--------------|--------|-------------|
-| **GPU Stream Compaction** | 🔥 **Main speedup** | Reduces D2H transfer from ~160ms to minimal overhead |
-| **Pinned Memory** | H2D: ~15ms | Uses `HostBuffer` for fast host-to-device transfer |
-| **Hierarchical Prefix Sums** | GPU: efficient | Parallel scans using block primitives |
-| **Fused Kernels** | Lower overhead | Single-pass quote detection + structural bitmap |
+| **GPU Stream Compaction** | 🔥 **Main speedup** | Reduces D2H transfer from ~160 MB to ~4 MB of position indices |
+| **Pinned Memory** | H2D: ~15 ms | Uses `HostBuffer` for fast host-to-device transfer |
+| **Lean pipeline** | unifies all backends | One fused kernel + positions-only stream compaction. No popcount + hierarchical prefix-sum cascade (the in-string mask is applied CPU-side by the tape adapter, byte-by-byte), no `pair_pos` array (the tape adapter does not need bracket pairs), no `char_types` companion stream out of the GPU. Same pipeline on NVIDIA, AMD, and Apple Metal. |
+| **Fused Kernel** | Lower overhead | Single kernel emits both the `{}[]:,` structural bitmap and the `{}[]` open-close bitmap. |
 
 ## Why json is Faster: The Stream Compaction Advantage
 
@@ -58,30 +61,35 @@ TOTAL:                ~236 ms
 Throughput:           3.6 GB/s
 ```
 
-### json GPU Pipeline (~121ms total)
+### json GPU Pipeline (~130 ms total, lean)
 
 ```
-json pinned breakdown (average):
-├─ H2D transfer:       ~15 ms   (804MB → GPU, pinned memory)
-├─ GPU kernels:        ~30 ms   (quote detection + prefix sums + bitmap)
-├─ Stream compact:     ~50 ms   (GPU position extraction)
-├─ D2H transfer:       ~15 ms   (4MB positions → CPU)
-└─ Bracket matching:   ~11 ms   (CPU)
+json pinned breakdown (B200):
+├─ H2D + alloc:       ~15 ms   (804 MB → GPU, pinned memory + buffer alloc)
+├─ Fused kernel:       ~2 ms   ({}[]:,/{}[]  bitmaps in one launch)
+├─ Stream compact:    ~95 ms   (popcount + block prefix sum + scatter, positions-only)
+└─ D2H + finalize:    ~17 ms   (~4 MB positions → CPU + JSONResult fill)
 ────────────────────────────────
-TOTAL:                ~121 ms
-Throughput:           7.0 GB/s
+TOTAL:               ~130 ms
+Throughput:           ~6.5 GB/s (pinned wall-clock)
 ```
+
+There is no GPU-side in-string mask and no CPU bracket-matching
+pass. The tape adapter walks the byte stream once to apply the
+escape state machine and stage 2 directly consumes
+`gpu_result.structural`; `pair_pos` is left as a placeholder for
+legacy iterator ABI compatibility.
 
 ## Architecture Comparison
 
 | Aspect | cuJSON | json |
 |--------|--------|--------|
 | **Input memory** | Pinned (cudaMallocHost) | Pinned (HostBuffer) |
-| **H2D transfer** | ✓ (15ms) | ✓ (15ms) |
-| **GPU kernels** | Validation + Tokenization | Quote detection + Prefix sums + Bitmap |
-| **Position extraction** | ❌ (transfers all data) | ✅ **GPU stream compaction** |
-| **D2H transfer** | 465MB (~160ms) | 4MB (~15ms) |
-| **Bracket matching** | GPU (Parser kernel) | CPU (stack algorithm) |
+| **H2D transfer** | ✓ (15 ms) | ✓ (15 ms) |
+| **GPU kernels** | Validation + Tokenization | Single fused kernel emits `{}[]:,` + `{}[]` bitmaps |
+| **Position extraction** | ❌ (transfers all data) | ✅ **GPU stream compaction (positions only)** |
+| **D2H transfer** | 465 MB (~160 ms) | 4 MB (~15 ms) |
+| **Bracket / pair-match** | GPU (Parser kernel) | not done -- the tape adapter walks the byte stream once on the CPU and does not need a `pair_pos` array |
 
 ## Performance Metrics Explained
 
@@ -125,21 +133,19 @@ not representative.
 
 804 MB `twitter_large_record.json`:
 
-| Platform | Throughput | vs cuJSON | Pipeline |
-|---|---:|---|---|
-| AMD MI355X | 13 GB/s | **3.6x** | single-shot |
-| NVIDIA B200 | 8 GB/s | **1.8x** | single-shot |
-| Apple M3 Pro | 3.1 GB/s | n/a | lean Metal |
+| Platform | Throughput | Pipeline |
+|---|---:|---|
+| AMD MI355X | 13 GB/s | lean (single-shot) |
+| NVIDIA B200 | ~6.5 GB/s | lean (single-shot, pinned wall-clock) |
+| Apple M3 Pro | 3.1 GB/s | lean Metal (chunked at 64 MB) |
 
-The Apple Metal path runs a lean variant of the NVIDIA / AMD
-pipeline: it drops the popcount and hierarchical prefix-sum stages
-(the GPU-side in-string mask is not used), drops the CPU
-`_match_brackets_fast` pass (the v0.2 tape adapter does not consume
-`pair_pos`), and emits a positions-only stream-compaction output
-(skipping the `char_types` D2H copy, which is around 66 MB on
-`twitter_large_record`). `gpu/tape_adapter.mojo` applies the
-in-string filter on the CPU side using the same byte walk that
-stage 2 already needed.
+All backends run the same lean pipeline: one fused kernel + a
+positions-only stream-compaction extract. The GPU does not build an
+in-string mask and does not produce a `char_types` companion stream
+(which would have been a ~66 MB D2H copy on `twitter_large_record`).
+`gpu/tape_adapter.mojo` walks the byte stream once on the CPU to
+apply the escape state machine and feeds stage 2 of the CPU pipeline
+to construct the tape -- the same stage 2 the CPU-only path uses.
 
 ## CPU Performance
 
@@ -176,6 +182,13 @@ protocol:
   pre-builds a `List[String]` of independent copies outside the
   timed region. The simdjson side reuses one buffer because its
   parser does not consume the input.
+* Mojo bench binaries are built with `mojo build -D ASSERT=none`,
+  which strips the Mojo stdlib's safety asserts (the default
+  `ASSERT=safe` keeps them in for development). This matches
+  simdjson C++'s `-O3` posture; running with the default
+  `ASSERT=safe` build is roughly 20-37% slower on these workloads
+  and is not an apples-to-apples comparison. `pixi run -e dev
+  bench-cpu` already wires the flag in.
 
 Two workloads:
 
@@ -187,15 +200,13 @@ Two workloads:
   This is what real consumers do, and on the tape representation
   it adds only a small constant on top of `parse_only`.
 
-### Numbers (Apple Silicon, M-series, this dev box)
+### Numbers (x86 host, Mojo native two-pass)
 
-| Corpus | Size | simdjson `parse_only` | mojo `parse_only` (simd) | simdjson `parse_traverse` | mojo `parse_traverse` (simd) |
-|---|---|---|---|---|---|
-| `twitter.json` | 616 KB | 0.235 ms / 2.68 GB/s | 0.54 ms / 1.17 GB/s | 0.236 ms / 2.67 GB/s | 1.12 ms / 0.57 GB/s |
-| `citm_catalog.json` | 1.7 MB | 0.440 ms / 3.92 GB/s | 1.09 ms / 1.58 GB/s | 0.528 ms / 3.27 GB/s | 2.49 ms / 0.69 GB/s |
+| Corpus | Size | `parse_only` (simd) | `parse_traverse` (simd) |
+|---|---|---|---|
+| `twitter.json` | 616 KB | 0.598 ms / 1.06 GB/s | 0.985 ms / 0.64 GB/s |
+| `citm_catalog.json` | 1.7 MB | 1.109 ms / 1.56 GB/s | 1.980 ms / 0.87 GB/s |
 
-* `parse_only` gap: 2.3x on `twitter.json`, 2.5x on `citm_catalog.json`.
-* `parse_traverse` gap: ~4-5x on both corpora.
 * The Mojo `parse_traverse` cost is ~2x the `parse_only` cost --
   traversal walks every tape slot and materializes zero-copy keys
   / strings on demand. There is no on-access re-parse, no raw
@@ -204,8 +215,11 @@ Two workloads:
 * simdjson's `target='cpu-simdjson'` FFI shim is intentionally not
   in this table; the FFI marshalling cost dominates and it has not
   been competitive with the native Mojo path for several releases.
+  The simdjson C++ reference baseline is reproducible via
+  `pixi run -e dev bench-cpu <file>`, which runs the simdjson C++
+  binary first and then the Mojo parser under the same protocol.
 
-### What landed in v0.2's parity push
+### Key CPU optimizations
 
 Stage 1 (structural indexing) -- now ~5+ GB/s in isolation:
 
@@ -246,25 +260,19 @@ Stage 2 (tape emission):
 
 ### What's left to close the gap
 
-The remaining ~2.3-2.5x on `parse_only` is algorithmic:
+The remaining gap on `parse_only` is algorithmic:
 
-1. **Recursive `_emit_value`** dispatches via Mojo function calls
-   per child. simdjson uses a flat tape walker with no recursion;
-   replicating that needs a non-trivial state-machine refactor.
-2. **No Eisel-Lemire float fast path.** `_emit_number` still spills
+1. **No Eisel-Lemire float fast path.** `_emit_number` still spills
    to `atof` for floats. Eisel-Lemire would parse most floats
    without allocation; integer parsing already uses SWAR.
-3. **Stage 2 still re-validates byte content** between adjacent
+2. **Stage 2 still re-validates byte content** between adjacent
    structurals to reject inputs like `[1foo, 2]`. simdjson trusts
    stage 1's structural index fully; doing the same here would
    remove the per-value `_skip_ws` re-scan but requires stage 1 to
    detect non-whitespace, non-structural bytes outside strings.
-4. **AVX-512 64-byte chunks** are not yet enabled on hosts that
+3. **AVX-512 64-byte chunks** are not yet enabled on hosts that
    support `vpternlogq`; the 32-byte NEON / AVX2 path is what we
    measure today.
-
-These are tracked in `.cursor/rules/plans.mdc` (remaining Phase 6
-items).
 
 ## When to Use GPU vs CPU
 
@@ -298,21 +306,28 @@ Using `HostBuffer` (pinned memory) for H2D transfers:
 - Pageable: ~110ms for 804MB
 - **Speedup:** 7.3x faster
 
-### 3. Hierarchical Prefix Sums
+### 3. Block-level Prefix Sums (stream compaction)
 
-For computing in-string regions, we use block-level prefix sums:
+The positions-only stream compaction needs an exclusive prefix sum
+over per-word popcounts so each thread knows where to scatter its
+positions:
 
-1. Each block computes local prefix sum using `block.prefix_sum`
-2. Last value from each block propagates to next block
-3. Single-pass algorithm, minimal synchronization
+1. Each block computes a local prefix sum using `block.prefix_sum`.
+2. Block totals are propagated up the hierarchy and added back into
+   per-block prefixes.
+3. Single-pass algorithm, minimal synchronization.
 
-### 4. Fused Kernels
+### 4. Fused Kernel
 
-Combine multiple operations in single kernel launches:
+A single kernel walks 32 input bytes per thread and emits two
+32-bit-per-thread bitmaps:
 
-- Quote detection + escape handling
-- Structural character extraction + bitmap creation
-- Reduces kernel launch overhead
+- The raw `{}[]:,` structural bitmap consumed by stream compaction.
+- The `{}[]` open-close bitmap (reserved for downstream use).
+
+In-string detection lives on the CPU side
+(`gpu/tape_adapter._result_to_index`), where the same byte walk that
+stage 2 already needs runs the correct escape state machine.
 
 ### 5. Minimize Memory Allocations
 
@@ -322,9 +337,13 @@ Combine multiple operations in single kernel launches:
 
 ### 6. Hybrid GPU/CPU Pipeline
 
-- **GPU:** Parallel bitmap operations (where GPU excels)
-- **CPU:** Sequential bracket matching (where CPU is sufficient)
-- **Key insight:** Don't force everything on GPU; use the right tool for each step
+- **GPU:** parallel bitmap operations + stream compaction.
+- **CPU:** the escape state machine + tape construction in the
+  existing stage 2 pass.
+- **Key insight:** keep the GPU on the work it parallelises well
+  (structural classification + scatter), and let the CPU handle
+  byte-by-byte state that doesn't parallelise cleanly inside a
+  single 32-byte chunk.
 
 ## Performance Variance
 
@@ -340,10 +359,13 @@ GPU performance can vary between runs due to:
 
 Potential improvements for even better performance:
 
-1. **GPU bracket matching:** Could eliminate CPU bottleneck (~11ms)
-2. **Multi-GPU support:** For files > 1GB
-3. **Streaming parser:** Process chunks as they arrive
-4. **Zero-copy Value tree:** Build tree directly on GPU memory
+1. **Apple UMA-aware single-buffer pipeline:** drop the H2D leg on
+   unified-memory hosts by writing directly into a unified-memory
+   `DeviceBuffer`.
+2. **Multi-GPU / multi-stream overlap:** launch the next chunk's
+   H2D while the previous chunk's kernel runs.
+3. **Streaming parser:** Process chunks as they arrive.
+4. **Zero-copy Value tree:** Build tree directly on GPU memory.
 
 ## Benchmark Reproducibility
 

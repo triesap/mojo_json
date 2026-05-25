@@ -1,21 +1,16 @@
 # json - Copy-on-write owned tree representation.
 #
-# `OwnedValue` is the structured tree representation of a JSON value.
-# Phase B routes `Value.set` / `Value.append` / `Value.set_at` through
-# this type instead of doing raw-string surgery on `Value._raw`. The
-# rewrite path is:
+# `OwnedValue` is the structured tree representation of a JSON value
+# used for mutation. `Value.set` / `Value.append` / `Value.set_at`
+# route through this type instead of doing raw-string surgery on
+# `Value._raw`. The rewrite path is:
 #
 #   raw_json --(_value_to_owned)--> OwnedValue --(mutate)--> OwnedValue
 #                                                                |
 #   raw_json <--(_owned_to_json)----------------------------------+
 #
-# This is O(N) per mutation (same big-O as v0.1 raw-string surgery)
-# but eliminates the silent-bug class where surgery on a sibling
-# subtree corrupts adjacent text. Phase D / a future v0.3 may keep
-# the OwnedValue resident across calls instead of round-tripping
-# through the raw string each time; for now the round-trip preserves
-# the v0.1 invariant that `Value.raw_json()` reflects the latest
-# mutation.
+# This is O(N) per mutation but eliminates the silent-bug class where
+# surgery on a sibling subtree corrupts adjacent text.
 
 from std.collections import List
 from std.collections.dict import Dict
@@ -560,7 +555,7 @@ def _serialize_into_value(o: OwnedValue) -> Value:
 
     Builds a fresh `Document` from the OwnedValue tree (no JSON
     string round-trip, no parsing) and returns a view over it. The
-    layout matches what the v0.2 CPU and FFI parsers emit, so callers
+    layout matches what the CPU and FFI parsers emit, so callers
     don't need to care which source produced the value.
 
     Used by `Value.set` / `Value.append` / `Value.set_at` to fold

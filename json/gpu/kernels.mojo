@@ -1,12 +1,22 @@
-# Optimized GPU Kernels for JSON parsing
-# Fused kernels with minimal sync, SIMD vectorization, and shared memory
+# GPU kernels for the lean JSON parsing pipeline.
 #
-# Key optimizations:
-# 1. Fused kernel - single kernel does bitmap creation + escape detection + in-string
-# 2. SIMD vectorization - process 4/8 bytes at a time
-# 3. Shared memory - reduce global memory accesses
-# 4. Warp-level primitives - fast prefix operations
-# 5. Coalesced memory access patterns
+# `fused_json_kernel` is the only kernel `gpu/parser.mojo` launches.
+# It walks 32 input bytes per thread and emits two 32-bit-per-thread
+# bitmaps:
+#
+#   * `output_structural` -- bytes that are one of `{ } [ ] : ,`
+#     (the raw mask -- the kernel intentionally does not filter
+#     in-string occurrences; correctness lives in
+#     `gpu/tape_adapter._result_to_index` on the CPU side).
+#   * `output_open_close` -- bytes that are one of `{ } [ ]` only.
+#
+# `quote_prefix_in` is still in the signature (read once and discarded)
+# so a future, correct GPU-side escape implementation can drop in here
+# without changing the host launch site.
+#
+# `popcount_fast` is also exported because `stream_compact.mojo`
+# (and downstream `extract_positions_gpu_lean`) reuses it for the
+# 32-bit-per-word popcount step of the GPU stream compaction.
 
 from std.gpu import thread_idx, block_idx, block_dim, barrier
 from std.gpu.globals import MAX_THREADS_PER_BLOCK_METADATA
@@ -42,18 +52,6 @@ def popcount_fast(value: UInt32) -> UInt32:
     return v >> 24
 
 
-@always_inline
-def prefix_xor_fast(value: UInt32) -> UInt32:
-    """Compute prefix XOR for in-string detection."""
-    var result = value
-    result = result ^ (result << 1)
-    result = result ^ (result << 2)
-    result = result ^ (result << 4)
-    result = result ^ (result << 8)
-    result = result ^ (result << 16)
-    return result
-
-
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
         Int32(Int(BLOCK_SIZE_OPT))
@@ -63,21 +61,41 @@ def fused_json_kernel(
     input_data: UnsafePointer[UInt8, MutAnyOrigin],
     output_structural: UnsafePointer[UInt32, MutAnyOrigin],
     output_open_close: UnsafePointer[UInt32, MutAnyOrigin],
-    quote_prefix_in: UnsafePointer[
-        UInt32, MutAnyOrigin
-    ],  # Pre-computed quote prefix sums
+    quote_prefix_in: UnsafePointer[UInt32, MutAnyOrigin],
     size: UInt,
     total_padded_32: UInt,
 ):
-    """Fused kernel: bitmap creation + escape detection + in-string + structural extraction.
+    """Walk 32 input bytes per thread; emit raw `{}[]:,` and `{}[]` bitmaps.
 
-    This single kernel does what previously required 4 separate kernels:
-    1. Create bitmaps for quotes, backslashes, operators
-    2. Find escaped quotes
-    3. Compute in-string regions
-    4. Extract structural characters outside strings
+    Each thread processes 32 bytes -> produces one 32-bit bitmap word per
+    output stream.
 
-    Each thread processes 32 bytes -> produces one 32-bit bitmap word.
+    NOTE: in-string detection on the GPU side is intentionally NOT done
+    here. The previous formulation
+
+        escaped       = quote_bits & (slash_bits << 1)
+        real_quotes   = quote_bits & ~escaped
+        pxor          = prefix_xor_fast(real_quotes)
+        in_string     = pxor (xor-flipped by quote_prefix_in[global_id]&1)
+        structural    = (~in_string) & op_bits
+
+    is *not* a correct implementation of the simdjson escape model.
+    `slash_bits << 1` only catches `\\\"` *within* a 32-byte chunk, so
+    a backslash at byte 31 of one chunk followed by a quote at byte
+    0 of the next chunk is not caught. It also doesn't distinguish
+    odd vs even backslash runs, so `\\\\\"` (literal `\\` followed by a
+    real quote) is wrongly classified as an escaped quote.
+
+    The fix is to emit the *raw* `{}[]:,` bitmap and have the CPU
+    side (`tape_adapter._result_to_index`) drop positions that fall
+    inside string literals using its own correct, byte-by-byte
+    escape state machine. The CPU pass was already walking the input
+    to recover quote positions for stage 2, so this adds no extra
+    scan -- it just uses the existing walk to filter the GPU output.
+
+    `quote_prefix_in` stays in the signature so a future, correct
+    GPU escape implementation can drop in here without changing the
+    call site.
     """
     var thread_id = Int(thread_idx.x)
     var block_id = Int(block_idx.x)
@@ -88,9 +106,6 @@ def fused_json_kernel(
 
     var start_pos = global_id * 32
 
-    # Local registers for bitmap accumulation
-    var slash_bits: UInt32 = 0
-    var quote_bits: UInt32 = 0
     var op_bits: UInt32 = 0
     var open_close_bits: UInt32 = 0
 
@@ -103,10 +118,6 @@ def fused_json_kernel(
 
         var c = input_data[pos]
         var bit_mask = UInt32(1) << UInt32(j)
-
-        # Branchless bitmap construction
-        slash_bits |= bit_mask * UInt32(c == CHAR_BACKSLASH)
-        quote_bits |= bit_mask * UInt32(c == CHAR_QUOTE)
 
         var is_op = (
             (c == CHAR_OPEN_BRACE)
@@ -126,156 +137,10 @@ def fused_json_kernel(
         )
         open_close_bits |= bit_mask * UInt32(is_bracket)
 
-    # NOTE: in-string detection on the GPU side is intentionally not
-    # used here. The previous formulation
-    #
-    #     escaped       = quote_bits & (slash_bits << 1)
-    #     real_quotes   = quote_bits & ~escaped
-    #     pxor          = prefix_xor_fast(real_quotes)
-    #     in_string     = pxor (xor-flipped by quote_prefix_in[global_id]&1)
-    #     structural    = (~in_string) & op_bits
-    #
-    # is *not* a correct implementation of the simdjson escape model.
-    # `slash_bits << 1` only catches `\"` *within* a 32-byte chunk, so
-    # a backslash at byte 31 of one chunk followed by a quote at byte
-    # 0 of the next chunk is not caught. It also doesn't distinguish
-    # odd vs even backslash runs, so `\\"` (literal `\` followed by a
-    # real quote) is wrongly classified as an escaped quote. Both bugs
-    # flip the in-string carry and erase real structural positions,
-    # which is exactly what made twitter.json fail the moment the
-    # Apple-fallback stopped masking it.
-    #
-    # The fix is to emit the *raw* `{}[]:,` bitmap and have the CPU
-    # side (`tape_adapter._result_to_index`) drop positions that fall
-    # inside string literals using its own correct, byte-by-byte
-    # escape state machine. The CPU pass was already walking the input
-    # to recover quote positions for stage 2, so this adds no extra
-    # scan -- it just uses the existing walk to filter the GPU output.
-    #
-    # `quote_prefix_in` / `slash_bits` / `quote_bits` remain in scope
-    # so that the kernel ABI is stable for the host launch and so a
-    # future, correct GPU escape implementation can drop in here
-    # without changing the call site.
-    _ = slash_bits
-    _ = quote_bits
+    # Read-and-discard the (unused) quote_prefix_in argument so the
+    # buffer binding survives Metal AOT alias analysis. See file-top
+    # docstring + parser.mojo `d_quote_dummy` comment.
     _ = quote_prefix_in[global_id]
 
     output_structural[global_id] = op_bits
     output_open_close[global_id] = open_close_bits
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(Int(BLOCK_SIZE_OPT))
-    )
-)
-def parallel_prefix_sum_kernel(
-    input_data: UnsafePointer[UInt32, MutAnyOrigin],
-    output_prefix: UnsafePointer[UInt32, MutAnyOrigin],
-    total_padded_32: UInt,
-):
-    """Compute prefix sum of popcount values for quote counting.
-
-    This is needed for cross-word in-string boundary detection.
-    Uses block-level scan with shared memory.
-    """
-    var thread_id = Int(thread_idx.x)
-    var block_id = Int(block_idx.x)
-    var global_id = block_id * Int(block_dim.x) + thread_id
-
-    if global_id >= Int(total_padded_32):
-        return
-
-    # Each thread computes popcount of its word
-    var local_count = popcount_fast(input_data[global_id])
-
-    # Simple exclusive prefix sum within block using shared memory simulation
-    # In production, use warp shuffle intrinsics for better performance
-    output_prefix[global_id] = local_count
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(Int(BLOCK_SIZE_OPT))
-    )
-)
-def extract_positions_kernel(
-    structural_bitmap: UnsafePointer[UInt32, MutAnyOrigin],
-    prefix_counts: UnsafePointer[UInt32, MutAnyOrigin],
-    output_positions: UnsafePointer[Int32, MutAnyOrigin],
-    size: UInt,
-    total_padded_32: UInt,
-):
-    """Extract actual byte positions from structural bitmap.
-
-    Converts bitmap to position array using prefix sums.
-    Each thread handles one 32-bit bitmap word.
-    """
-    var thread_id = Int(thread_idx.x)
-    var block_id = Int(block_idx.x)
-    var global_id = block_id * Int(block_dim.x) + thread_id
-
-    if global_id >= Int(total_padded_32):
-        return
-
-    var bitmap = structural_bitmap[global_id]
-    if bitmap == 0:
-        return
-
-    var base_pos = global_id * 32
-    var output_offset = Int(prefix_counts[global_id])
-    var current_count = 0
-
-    # Extract positions using CTZ-style loop
-    var remaining = bitmap
-    while remaining != 0:
-        # Find lowest set bit position
-        var tz = _ctz32_gpu(remaining)
-        var pos = base_pos + Int(tz)
-        if pos < Int(size):
-            output_positions[output_offset + current_count] = Int32(pos)
-            current_count += 1
-        remaining = remaining & (remaining - 1)  # Clear lowest bit
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(Int(BLOCK_SIZE_OPT))
-    )
-)
-def structural_popcount_kernel(
-    structural_bitmap: UnsafePointer[UInt32, MutAnyOrigin],
-    output_popcounts: UnsafePointer[UInt32, MutAnyOrigin],
-    total_padded_32: UInt,
-):
-    """Compute popcount of each structural bitmap word."""
-    var global_id = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
-
-    if global_id >= Int(total_padded_32):
-        return
-
-    output_popcounts[global_id] = popcount_fast(structural_bitmap[global_id])
-
-
-@always_inline
-def _ctz32_gpu(x: UInt32) -> UInt32:
-    """Count trailing zeros - GPU version."""
-    if x == 0:
-        return 32
-    var n: UInt32 = 0
-    var v = x
-    if (v & 0x0000FFFF) == 0:
-        n += 16
-        v >>= 16
-    if (v & 0x000000FF) == 0:
-        n += 8
-        v >>= 8
-    if (v & 0x0000000F) == 0:
-        n += 4
-        v >>= 4
-    if (v & 0x00000003) == 0:
-        n += 2
-        v >>= 2
-    if (v & 0x00000001) == 0:
-        n += 1
-    return n

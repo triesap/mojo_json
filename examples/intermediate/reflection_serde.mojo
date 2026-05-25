@@ -7,8 +7,8 @@ to_json() or from_json() methods.
 Supported field types:
     Scalars: Int, Int64, Bool, Float64, Float32, String
     Containers: List[Int/String/Float64/Bool], Optional[Int/String/Float64/Bool]
-    v0.2 combinators: Dict[String, T], List[Optional[T]],
-                      Optional[List[T]], List[List[T]] (T scalar)
+    Combinators: Dict[String, T], List[Optional[T]],
+                 Optional[List[T]], List[List[T]] (T scalar)
     Nested structs, Value (raw JSON pass-through)
 """
 
@@ -332,8 +332,8 @@ def example_custom_traits() raises:
 
 
 def example_combinator_types() raises:
-    """V0.2 Phase F: Dict, nested lists, Optional<->List combinators."""
-    print("=== Combinator Types (v0.2) ===\n")
+    """Dict, nested lists, Optional<->List combinators."""
+    print("=== Combinator Types ===\n")
 
     var s = Stats()
     s.counts["wins"] = 7

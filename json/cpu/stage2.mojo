@@ -7,39 +7,30 @@
 # entries into a `Document` without ever re-scanning the byte stream
 # for structure.
 #
-# The decoupling is the real win in v0.2: future SIMD or GPU stage 1
-# implementations can be swapped in without touching value
-# construction. Children are always written before parents so a
-# parent's `child_start_idx` payload points backwards into a
-# contiguous run of header entries; the root is the last entry, which
-# is what `Document.root()` assumes.
+# Decoupling stage 1 from value construction means a different
+# structural scanner (e.g. the GPU pipeline) can drop in without
+# touching this module. Children are always written before parents
+# so a parent's `child_start_idx` payload points backwards into a
+# contiguous run of header entries; the root is the last entry,
+# which is what `Document.root()` assumes.
 #
-# Phase 1 perf rewrite (v0.2-F)
-# -----------------------------
-# The previous walker had three hot-path costs that scaled poorly on
-# real-world JSON (citm_catalog, twitter):
+# The walker is iterative: `parse_into_document` maintains an
+# explicit `List[_Frame]` work stack instead of recursing per
+# container, dispatches values inline, and only calls the primitive
+# helpers (`_emit_string`, `_emit_number`, `_parse_object_key`) that
+# cannot recurse. A shared `headers_scratch: List[UInt64]` collects
+# each container's children's headers and is `memcpy`'d into
+# `doc.tape` (and shrunk back) on container close, so we get a
+# single amortized allocation over the whole document rather than
+# one per container.
 #
-#   1. `positions.copy()` at entry. On citm that's a 117k-entry
-#      List[UInt32] copy on every parse. Now we read `index.positions`
-#      in place via an immutable borrow.
-#   2. `_find_matching_close` per container -- a forward bracket-counting
-#      scan over `positions`. For deeply-nested or wide objects this is
-#      O(structural_count * container_count). Replaced with a forward
-#      walk that discovers the close by inspecting the next position's
-#      byte (`positions` is monotonically increasing, so the next
-#      `]` / `}` for the current container *is* the next position whose
-#      byte is `]` / `}` after we've fully consumed the children).
-#   3. Per-container `headers: List[UInt64]`. Each container allocated
-#      its own header scratch and copied into `doc.tape` at close. We
-#      now share a single `headers_scratch: List[UInt64]` across all
-#      recursive calls; each container records `headers_lo = len(scratch)`
-#      on entry, appends its children's headers as they're parsed, then
-#      at close copies `scratch[headers_lo:]` to `doc.tape` and shrinks
-#      the scratch back to `headers_lo`. One allocation amortized over
-#      the whole document instead of one per container.
+# `_find_matching_close` is avoided entirely: `positions` is
+# monotonically increasing, so the next `]` / `}` for the current
+# container is just the next position whose byte is `]` / `}` after
+# the children have been fully consumed.
 #
 # Validation rules (trailing commas, double commas, leading commas,
-# missing colons, missing values after colons, unquoted keys) all still
+# missing colons, missing values after colons, unquoted keys) all
 # raise structured errors during the walk; coverage in
 # `tests/test_stage2_tape.mojo`.
 
@@ -189,7 +180,7 @@ def _skip_ws(bytes: Span[UInt8, _], start: Int, end: Int) -> Int:
                 var first_non_ws = Int(count_trailing_zeros(~ws_bits))
                 return i + first_non_ws
         else:
-            constrained[False, "unsupported simd_byte_width()"]()
+            comptime assert False, "unsupported simd_byte_width()"
         i += _BLOCK
 
     while i < end and _is_ws(ptr[i]):
@@ -287,20 +278,39 @@ def parse_two_pass_tape[
 
 
 # ---------------------------------------------------------------------------
-# Tape-emitting walker
+# Iterative tape-emitting walker
 #
-# `parse_into_document` walks a `StructuralIndex` and emits entries
-# into a `Document.tape`.
+# `parse_into_document` walks a `StructuralIndex` with an explicit
+# work stack -- one `_Frame` per open container ancestor -- and emits
+# entries directly into `doc.tape`. Primitive helpers (`_emit_string`,
+# `_emit_number`, `_parse_object_key`) are defined below; they don't
+# recurse, so they stay as functions.
 #
-# Layout follows the rules pinned in `json/document.mojo`:
-#   - Children are written before parents so the parent's
-#     `child_start_idx` payload points backwards into a contiguous run
-#     of header entries.
-#   - For an OBJECT, that contiguous run alternates KEY, VALUE, KEY,
-#     VALUE, ... (so `count` pairs occupy `2 * count` slots).
-#   - The root is the last entry, which is what `Document.root()`
-#     assumes.
+# Each outer iteration does one of:
+#   (a) emit a primitive at `cursor` and enter the attach phase
+#   (b) open a container at `cursor` (push frame) and loop back to
+#       parse the first child
+#
+# The inner "attach" loop walks back up the stack when a value sits
+# at one or more matching closes (e.g. `]]]` after the last leaf),
+# emitting each container header in turn.
 # ---------------------------------------------------------------------------
+
+
+struct _Frame(Copyable, Movable):
+    """One open container on the work stack."""
+
+    var kind: UInt8  # _FRAME_ARRAY or _FRAME_OBJECT
+    var headers_lo: Int  # checkpoint into headers_scratch
+
+    @always_inline
+    fn __init__(out self, kind: UInt8, headers_lo: Int):
+        self.kind = kind
+        self.headers_lo = headers_lo
+
+
+alias _FRAME_ARRAY: UInt8 = 0
+alias _FRAME_OBJECT: UInt8 = 1
 
 
 def parse_into_document(
@@ -330,40 +340,305 @@ def parse_into_document(
     # vector from reallocating mid-walk. The +8 covers the root
     # primitive case (positions can be empty for `42`).
     doc.tape.reserve(len(positions) + 8)
-    # Side-pool guesses: cheap to reserve, expensive to grow under
-    # contention with the tape append. ~10% of positions for floats /
-    # owned strings / keys is a generous overestimate on real corpora.
     var side_hint = len(positions) // 8 + 4
     doc.float_pool.reserve(side_hint)
     doc.string_pool.reserve(side_hint)
     doc.key_pool.reserve(side_hint)
 
     # Shared scratch for collecting children's headers across all
-    # recursive container frames. Each frame uses a contiguous slice
-    # `[lo, len(scratch))` and shrinks back to `lo` at close.
+    # frames. Each frame uses a contiguous slice `[lo, len(scratch))`
+    # and shrinks back to `lo` at close.
     var headers_scratch = List[UInt64]()
     headers_scratch.reserve(64)
 
-    var doc_start = _skip_ws(doc.input.as_bytes(), 0, n)
-    var pos_idx = 0
-    var value_end = doc_start
+    var stack = List[_Frame]()
+    stack.reserve(32)
 
-    var root_entry = _emit_value(
-        doc,
-        positions,
-        pos_idx,
-        headers_scratch,
-        value_end,
-        doc_start,
-        n,
-    )
+    var pos_idx = 0
+    var doc_start = _skip_ws(doc.input.as_bytes(), 0, n)
+    var cursor = doc_start
+
+    var root_header: UInt64 = 0
+    var root_value_end = doc_start
+    var have_root = False
+
+    while not have_root:
+        # --- PARSE_VALUE phase ----------------------------------------
+        # Emit a primitive, OR open a container (push frame + continue).
+        var bytes = doc.input.as_bytes()
+        var i = _skip_ws(bytes, cursor, n)
+        if i >= n:
+            raise Error("Stage 2: empty value")
+
+        var c = bytes[i]
+        var value_header: UInt64
+        var value_end: Int
+
+        if c == UInt8(ord("{")):
+            if pos_idx >= len(positions) or Int(positions[pos_idx]) != i:
+                raise Error("Stage 2: cursor desync at object open")
+            pos_idx += 1
+
+            var headers_lo = len(headers_scratch)
+            var after_open = _skip_ws(bytes, i + 1, n)
+            var bytes_ref = doc.input.as_bytes()
+
+            if (
+                pos_idx < len(positions)
+                and Int(positions[pos_idx]) == after_open
+                and after_open < n
+                and bytes_ref[after_open] == UInt8(ord("}"))
+            ):
+                # Empty object fast path -- no frame push.
+                pos_idx += 1
+                var child_start = len(doc.tape)
+                value_header = pack_tape_entry(
+                    TAPE_TAG_OBJECT,
+                    pack_pair(UInt64(0), UInt64(child_start)),
+                )
+                value_end = after_open + 1
+                # Fall through to ATTACH phase below.
+            else:
+                if after_open >= n:
+                    raise Error("Stage 2: unterminated object")
+                if bytes_ref[after_open] == UInt8(ord(",")):
+                    raise Error(
+                        "Stage 2: leading comma in object at offset "
+                        + String(after_open)
+                    )
+
+                stack.append(_Frame(_FRAME_OBJECT, headers_lo))
+                cursor = _parse_object_key(
+                    doc, positions, pos_idx, headers_scratch, after_open, n
+                )
+                continue  # outer loop: parse the value at cursor
+
+        elif c == UInt8(ord("[")):
+            if pos_idx >= len(positions) or Int(positions[pos_idx]) != i:
+                raise Error("Stage 2: cursor desync at array open")
+            pos_idx += 1
+
+            var headers_lo = len(headers_scratch)
+            var after_open = _skip_ws(bytes, i + 1, n)
+            var bytes_ref = doc.input.as_bytes()
+
+            if (
+                pos_idx < len(positions)
+                and Int(positions[pos_idx]) == after_open
+                and after_open < n
+                and bytes_ref[after_open] == UInt8(ord("]"))
+            ):
+                # Empty array fast path -- no frame push.
+                pos_idx += 1
+                var child_start = len(doc.tape)
+                value_header = pack_tape_entry(
+                    TAPE_TAG_ARRAY,
+                    pack_pair(UInt64(0), UInt64(child_start)),
+                )
+                value_end = after_open + 1
+                # Fall through to ATTACH phase below.
+            else:
+                if after_open >= n:
+                    raise Error("Stage 2: unterminated array")
+                if bytes_ref[after_open] == UInt8(ord(",")):
+                    raise Error(
+                        "Stage 2: leading comma in array at offset "
+                        + String(after_open)
+                    )
+
+                stack.append(_Frame(_FRAME_ARRAY, headers_lo))
+                cursor = after_open
+                continue  # outer loop: parse the value at cursor
+
+        elif c == UInt8(ord('"')):
+            var v_end = i
+            value_header = _emit_string(doc, positions, pos_idx, v_end, i)
+            value_end = v_end
+
+        elif c == UInt8(ord("n")):
+            if (
+                i + 4 > n
+                or bytes[i + 1] != UInt8(ord("u"))
+                or bytes[i + 2] != UInt8(ord("l"))
+                or bytes[i + 3] != UInt8(ord("l"))
+            ):
+                raise Error(
+                    "Stage 2: expected 'null' literal at offset " + String(i)
+                )
+            value_header = pack_tape_entry(TAPE_TAG_NULL, 0)
+            value_end = i + 4
+
+        elif c == UInt8(ord("t")):
+            if (
+                i + 4 > n
+                or bytes[i + 1] != UInt8(ord("r"))
+                or bytes[i + 2] != UInt8(ord("u"))
+                or bytes[i + 3] != UInt8(ord("e"))
+            ):
+                raise Error(
+                    "Stage 2: expected 'true' literal at offset " + String(i)
+                )
+            value_header = pack_tape_entry(TAPE_TAG_BOOL, 1)
+            value_end = i + 4
+
+        elif c == UInt8(ord("f")):
+            if (
+                i + 5 > n
+                or bytes[i + 1] != UInt8(ord("a"))
+                or bytes[i + 2] != UInt8(ord("l"))
+                or bytes[i + 3] != UInt8(ord("s"))
+                or bytes[i + 4] != UInt8(ord("e"))
+            ):
+                raise Error(
+                    "Stage 2: expected 'false' literal at offset " + String(i)
+                )
+            value_header = pack_tape_entry(TAPE_TAG_BOOL, 0)
+            value_end = i + 5
+
+        elif c == UInt8(ord("-")) or (
+            c >= UInt8(ord("0")) and c <= UInt8(ord("9"))
+        ):
+            var v_end = i
+            value_header = _emit_number(doc, v_end, i, n)
+            value_end = v_end
+
+        else:
+            raise Error("Stage 2: unexpected character at offset " + String(i))
+
+        # --- ATTACH phase ---------------------------------------------
+        # Attach `value_header` to its parent (or set as root). After
+        # a container close the container's own header becomes the
+        # new pending value, so we may chain through several closes
+        # (e.g. `]]]`) before parsing the next sibling.
+        while True:
+            if len(stack) == 0:
+                root_header = value_header
+                root_value_end = value_end
+                have_root = True
+                break  # inner; outer exits because have_root is set
+
+            headers_scratch.append(value_header)
+
+            var bytes2 = doc.input.as_bytes()
+            var j = _skip_ws(bytes2, value_end, n)
+            var top = stack[len(stack) - 1].copy()
+            var is_array = top.kind == _FRAME_ARRAY
+
+            if j >= n:
+                if is_array:
+                    raise Error("Stage 2: unterminated array")
+                else:
+                    raise Error("Stage 2: unterminated object")
+
+            var b = bytes2[j]
+            var matching_close = (
+                UInt8(ord("]")) if is_array else UInt8(ord("}"))
+            )
+
+            if b == matching_close:
+                if pos_idx >= len(positions) or Int(positions[pos_idx]) != j:
+                    if is_array:
+                        raise Error("Stage 2: cursor desync at array close")
+                    else:
+                        raise Error("Stage 2: cursor desync at object close")
+                pos_idx += 1
+
+                # Flush this frame's children (scratch[headers_lo:])
+                # into the tape and shrink scratch back to the
+                # checkpoint.
+                var count = len(headers_scratch) - top.headers_lo
+                var child_start = len(doc.tape)
+                if count > 0:
+                    doc.tape.resize(child_start + count, 0)
+                    memcpy(
+                        dest=doc.tape.unsafe_ptr() + child_start,
+                        src=headers_scratch.unsafe_ptr() + top.headers_lo,
+                        count=count,
+                    )
+                headers_scratch.shrink(top.headers_lo)
+
+                if is_array:
+                    value_header = pack_tape_entry(
+                        TAPE_TAG_ARRAY,
+                        pack_pair(UInt64(count), UInt64(child_start)),
+                    )
+                else:
+                    var pair_count = count // 2
+                    value_header = pack_tape_entry(
+                        TAPE_TAG_OBJECT,
+                        pack_pair(UInt64(pair_count), UInt64(child_start)),
+                    )
+
+                value_end = j + 1
+                _ = stack.pop()
+                # Continue inner loop: this container header is now
+                # the pending value and attaches to its own parent.
+                continue
+
+            if b != UInt8(ord(",")):
+                if is_array:
+                    raise Error(
+                        "Stage 2: expected ',' or ']' in array at offset "
+                        + String(j)
+                    )
+                else:
+                    raise Error(
+                        "Stage 2: expected ',' or '}' in object at offset "
+                        + String(j)
+                    )
+
+            if pos_idx >= len(positions) or Int(positions[pos_idx]) != j:
+                if is_array:
+                    raise Error("Stage 2: cursor desync at array comma")
+                else:
+                    raise Error("Stage 2: cursor desync at object comma")
+            pos_idx += 1
+
+            var next_cursor = _skip_ws(bytes2, j + 1, n)
+            if next_cursor >= n:
+                if is_array:
+                    raise Error(
+                        "Stage 2: trailing comma in array at offset "
+                        + String(j)
+                    )
+                else:
+                    raise Error(
+                        "Stage 2: trailing comma in object at offset "
+                        + String(j)
+                    )
+            var nb = bytes2[next_cursor]
+            if nb == matching_close:
+                if is_array:
+                    raise Error(
+                        "Stage 2: trailing comma in array at offset "
+                        + String(j)
+                    )
+                else:
+                    raise Error(
+                        "Stage 2: trailing comma in object at offset "
+                        + String(j)
+                    )
+            if is_array and nb == UInt8(ord(",")):
+                raise Error(
+                    "Stage 2: empty element between commas in array at"
+                    " offset "
+                    + String(next_cursor)
+                )
+
+            if is_array:
+                cursor = next_cursor
+            else:
+                cursor = _parse_object_key(
+                    doc, positions, pos_idx, headers_scratch, next_cursor, n
+                )
+            break  # inner; outer parses next value at cursor
 
     # Trailing-content check: nothing but whitespace allowed after the
     # top-level value.
-    var bytes2 = doc.input.as_bytes()
-    var t = value_end
+    var bytes_final = doc.input.as_bytes()
+    var t = root_value_end
     while t < n:
-        if not _is_ws(bytes2[t]):
+        if not _is_ws(bytes_final[t]):
             raise Error(
                 "Stage 2: trailing content after top-level JSON value at"
                 " offset "
@@ -371,98 +646,90 @@ def parse_into_document(
             )
         t += 1
 
-    # The root is the last appended entry.
-    doc.tape.append(root_entry)
+    # Root is the last appended entry.
+    doc.tape.append(root_header)
     return doc^
 
 
 # ---------------------------------------------------------------------------
-# Recursive emitters.
-#
-# Each `_emit_*` function:
-#
-#   - reads positions[pos_idx..] and bytes starting at `start`,
-#   - appends 0 or more descendant headers to `doc.tape` (and side
-#     pools) as it parses,
-#   - returns this value's own header (NOT yet appended to doc.tape;
-#     the caller is responsible for either appending it or stashing
-#     it in the shared `headers_scratch`),
+# Non-recursive emitters used by `parse_into_document`.
+# Each helper:
+#   - reads `positions[pos_idx..]` and `bytes` starting at `start`,
+#   - returns this value's own header (the caller decides whether to
+#     append it to `doc.tape` directly or stash it in
+#     `headers_scratch`),
 #   - advances `pos_idx` and `value_end` so the caller knows how far
-#     into the input it consumed without re-scanning.
+#     into the input it consumed.
 # ---------------------------------------------------------------------------
 
 
-def _emit_value(
+def _parse_object_key(
     mut doc: Document,
     positions: List[UInt32],
     mut pos_idx: Int,
     mut headers_scratch: List[UInt64],
-    mut value_end: Int,
-    start: Int,
+    cursor: Int,
     n: Int,
-) raises -> UInt64:
-    """Emit a single value's header. May write descendants into
-    `doc.tape` as a side effect. Sets `value_end` to the byte offset
-    just past the parsed value (or just past its closing
-    bracket / quote)."""
+) raises -> Int:
+    """Parse one OBJECT key + colon starting at `cursor` (must point at
+    an opening quote). Appends the key header (TAPE_TAG_KEY or
+    TAPE_TAG_KEY_INLINE) to `headers_scratch`, advances `pos_idx`
+    past both key-quote positions plus the colon position, and
+    returns the byte offset where the value starts (whitespace
+    already skipped). Error messages match the recursive emitter so
+    `tests/test_stage2_tape.mojo` stays green."""
     var bytes = doc.input.as_bytes()
-    var i = _skip_ws(bytes, start, n)
-    if i >= n:
-        raise Error("Stage 2: empty value")
-
-    var c = bytes[i]
-    if c == UInt8(ord("{")):
-        return _emit_object(
-            doc, positions, pos_idx, headers_scratch, value_end, i, n
+    if bytes[cursor] != UInt8(ord('"')):
+        raise Error(
+            "Stage 2: expected string key at offset " + String(cursor)
         )
-    if c == UInt8(ord("[")):
-        return _emit_array(
-            doc, positions, pos_idx, headers_scratch, value_end, i, n
-        )
-    if c == UInt8(ord('"')):
-        return _emit_string(doc, positions, pos_idx, value_end, i)
-    if c == UInt8(ord("n")):
-        # null literal -- 4 bytes, no positions consumed.
-        if (
-            i + 4 > n
-            or bytes[i + 1] != UInt8(ord("u"))
-            or bytes[i + 2] != UInt8(ord("l"))
-            or bytes[i + 3] != UInt8(ord("l"))
-        ):
-            raise Error(
-                "Stage 2: expected 'null' literal at offset " + String(i)
-            )
-        value_end = i + 4
-        return pack_tape_entry(TAPE_TAG_NULL, 0)
-    if c == UInt8(ord("t")):
-        if (
-            i + 4 > n
-            or bytes[i + 1] != UInt8(ord("r"))
-            or bytes[i + 2] != UInt8(ord("u"))
-            or bytes[i + 3] != UInt8(ord("e"))
-        ):
-            raise Error(
-                "Stage 2: expected 'true' literal at offset " + String(i)
-            )
-        value_end = i + 4
-        return pack_tape_entry(TAPE_TAG_BOOL, 1)
-    if c == UInt8(ord("f")):
-        if (
-            i + 5 > n
-            or bytes[i + 1] != UInt8(ord("a"))
-            or bytes[i + 2] != UInt8(ord("l"))
-            or bytes[i + 3] != UInt8(ord("s"))
-            or bytes[i + 4] != UInt8(ord("e"))
-        ):
-            raise Error(
-                "Stage 2: expected 'false' literal at offset " + String(i)
-            )
-        value_end = i + 5
-        return pack_tape_entry(TAPE_TAG_BOOL, 0)
-    if c == UInt8(ord("-")) or (c >= UInt8(ord("0")) and c <= UInt8(ord("9"))):
-        return _emit_number(doc, value_end, i, n)
 
-    raise Error("Stage 2: unexpected character at offset " + String(i))
+    if pos_idx + 1 >= len(positions) or Int(positions[pos_idx]) != cursor:
+        raise Error("Stage 2: cursor desync at object key")
+    var key_close = Int(positions[pos_idx + 1])
+    pos_idx += 2
+
+    var key_start = cursor + 1
+    var key_len = key_close - key_start
+    var has_escape = _string_has_escape(bytes, key_start, key_close)
+
+    var key_header: UInt64
+    if has_escape:
+        # Slow path: keys with escapes still need allocation +
+        # interning. They are rare on real JSON corpora.
+        _validate_escapes(bytes, key_start, key_close)
+        var unesc = unescape_json_string_span(bytes, key_start, key_close)
+        var key = String(unsafe_from_utf8=unesc^)
+        var key_pool_idx = len(doc.key_pool)
+        doc.key_pool.append(key^)
+        key_header = pack_tape_entry(TAPE_TAG_KEY, UInt64(key_pool_idx))
+    else:
+        # Fast path: zero-copy KEY_INLINE -- store (offset, length)
+        # into input. No allocation, no memcpy, no key_pool append.
+        key_header = pack_tape_entry(
+            TAPE_TAG_KEY_INLINE,
+            pack_pair(UInt64(key_start), UInt64(key_len)),
+        )
+
+    var after_key = _skip_ws(bytes, key_close + 1, n)
+    if after_key >= n or bytes[after_key] != UInt8(ord(":")):
+        raise Error(
+            "Stage 2: missing ':' between key and value at offset "
+            + String(after_key)
+        )
+    var value_start = _skip_ws(bytes, after_key + 1, n)
+    if value_start >= n:
+        raise Error(
+            "Stage 2: missing value after ':' at offset " + String(after_key)
+        )
+
+    headers_scratch.append(key_header)
+
+    if pos_idx >= len(positions) or Int(positions[pos_idx]) != after_key:
+        raise Error("Stage 2: cursor desync at object colon")
+    pos_idx += 1
+
+    return value_start
 
 
 def _emit_string(
@@ -472,9 +739,10 @@ def _emit_string(
     mut value_end: Int,
     open_quote: Int,
 ) raises -> UInt64:
-    """Same string-parsing logic as before but reads positions in
-    place. Emits a STRING (clean, zero-copy slice into input) or
-    STRING_OWNED (post-unescape copy in `string_pool`) header."""
+    """Emit a STRING (clean, zero-copy slice into input) or
+    STRING_OWNED (post-unescape copy in `string_pool`) header.
+    Reads `positions` in place; advances `pos_idx` past the open and
+    close quotes."""
     if pos_idx >= len(positions) or Int(positions[pos_idx]) != open_quote:
         raise Error(
             "Stage 2: cursor desync at string open offset " + String(open_quote)
@@ -515,8 +783,8 @@ def _emit_number(
     start: Int,
     n: Int,
 ) raises -> UInt64:
-    """Same number-parsing logic as `_parse_number`. Inlines small
-    ints in the 60-bit payload; large ints and floats spill to side
+    """Parse a JSON number starting at `start`. Inlines small ints in
+    the 60-bit tape payload; large ints and floats spill to side
     pools."""
     var bytes = doc.input.as_bytes()
     var i = start
@@ -561,295 +829,3 @@ def _emit_number(
     var v = parse_int_swar(bytes, start, i)
     var payload = UInt64(v) & ((UInt64(1) << 60) - 1)
     return pack_tape_entry(TAPE_TAG_INT, payload)
-
-
-def _emit_array(
-    mut doc: Document,
-    positions: List[UInt32],
-    mut pos_idx: Int,
-    mut headers_scratch: List[UInt64],
-    mut value_end: Int,
-    open_offset: Int,
-    n: Int,
-) raises -> UInt64:
-    """Emit an ARRAY header by walking the structural index forward.
-
-    No bracket-counting pre-pass: we recurse into each child via
-    `_emit_value`, and after the child returns we inspect the next
-    structural position. The next position whose byte is `]` is
-    necessarily the close for *this* array (because any `]` belonging
-    to a nested array has already been consumed by the recursive
-    `_emit_array` for that nested container).
-
-    Children's headers go through `headers_scratch` -- a single shared
-    list across all recursive frames. We record `headers_lo` on entry,
-    each child appends its header to `headers_scratch`, and at close
-    we copy `headers_scratch[headers_lo:]` into `doc.tape` and shrink
-    the scratch back to `headers_lo`.
-
-    Validation rules: leading comma, trailing comma, double comma,
-    unmatched / missing close all raise structured errors.
-    """
-    if pos_idx >= len(positions) or Int(positions[pos_idx]) != open_offset:
-        raise Error("Stage 2: cursor desync at array open")
-    pos_idx += 1
-
-    var headers_lo = len(headers_scratch)
-
-    var cursor = _skip_ws(doc.input.as_bytes(), open_offset + 1, n)
-
-    # Empty array fast path.
-    var bytes_ref = doc.input.as_bytes()
-    if (
-        pos_idx < len(positions)
-        and Int(positions[pos_idx]) == cursor
-        and bytes_ref[cursor] == UInt8(ord("]"))
-    ):
-        pos_idx += 1
-        value_end = cursor + 1
-        var child_start = len(doc.tape)
-        return pack_tape_entry(
-            TAPE_TAG_ARRAY,
-            pack_pair(UInt64(0), UInt64(child_start)),
-        )
-
-    if cursor < n and bytes_ref[cursor] == UInt8(ord(",")):
-        raise Error(
-            "Stage 2: leading comma in array at offset " + String(cursor)
-        )
-    if cursor >= n:
-        raise Error("Stage 2: unterminated array")
-
-    while True:
-        var child_end = cursor
-        var h = _emit_value(
-            doc,
-            positions,
-            pos_idx,
-            headers_scratch,
-            child_end,
-            cursor,
-            n,
-        )
-        headers_scratch.append(h)
-
-        var bytes = doc.input.as_bytes()
-        var j = _skip_ws(bytes, child_end, n)
-        if j >= n:
-            raise Error("Stage 2: unterminated array")
-
-        var b = bytes[j]
-        if b == UInt8(ord("]")):
-            # Sanity check: this ']' must be the next structural pos.
-            if pos_idx >= len(positions) or Int(positions[pos_idx]) != j:
-                raise Error("Stage 2: cursor desync at array close")
-            pos_idx += 1
-            value_end = j + 1
-            break
-
-        if b != UInt8(ord(",")):
-            raise Error(
-                "Stage 2: expected ',' or ']' in array at offset " + String(j)
-            )
-        # Consume the comma.
-        if pos_idx >= len(positions) or Int(positions[pos_idx]) != j:
-            raise Error("Stage 2: cursor desync at array comma")
-        pos_idx += 1
-
-        var next_cursor = _skip_ws(bytes, j + 1, n)
-        if next_cursor >= n:
-            raise Error(
-                "Stage 2: trailing comma in array at offset " + String(j)
-            )
-        var nb = bytes[next_cursor]
-        if nb == UInt8(ord("]")):
-            raise Error(
-                "Stage 2: trailing comma in array at offset " + String(j)
-            )
-        if nb == UInt8(ord(",")):
-            raise Error(
-                "Stage 2: empty element between commas in array at offset "
-                + String(next_cursor)
-            )
-        cursor = next_cursor
-
-    # Flush this frame's children to doc.tape via memcpy and shrink
-    # the scratch.
-    var count = len(headers_scratch) - headers_lo
-    var child_start = len(doc.tape)
-    if count > 0:
-        doc.tape.resize(child_start + count, 0)
-        memcpy(
-            dest=doc.tape.unsafe_ptr() + child_start,
-            src=headers_scratch.unsafe_ptr() + headers_lo,
-            count=count,
-        )
-    headers_scratch.shrink(headers_lo)
-
-    return pack_tape_entry(
-        TAPE_TAG_ARRAY,
-        pack_pair(UInt64(count), UInt64(child_start)),
-    )
-
-
-def _emit_object(
-    mut doc: Document,
-    positions: List[UInt32],
-    mut pos_idx: Int,
-    mut headers_scratch: List[UInt64],
-    mut value_end: Int,
-    open_offset: Int,
-    n: Int,
-) raises -> UInt64:
-    """Emit an OBJECT header. Same single-pass-forward design as
-    `_emit_array`, but each iteration parses a (KEY, VALUE) pair.
-    KEY is interned into `doc.key_pool`."""
-    if pos_idx >= len(positions) or Int(positions[pos_idx]) != open_offset:
-        raise Error("Stage 2: cursor desync at object open")
-    pos_idx += 1
-
-    var headers_lo = len(headers_scratch)
-
-    var cursor = _skip_ws(doc.input.as_bytes(), open_offset + 1, n)
-
-    # Empty object fast path.
-    var bytes_ref = doc.input.as_bytes()
-    if (
-        pos_idx < len(positions)
-        and Int(positions[pos_idx]) == cursor
-        and bytes_ref[cursor] == UInt8(ord("}"))
-    ):
-        pos_idx += 1
-        value_end = cursor + 1
-        var child_start = len(doc.tape)
-        return pack_tape_entry(
-            TAPE_TAG_OBJECT,
-            pack_pair(UInt64(0), UInt64(child_start)),
-        )
-
-    if cursor < n and bytes_ref[cursor] == UInt8(ord(",")):
-        raise Error(
-            "Stage 2: leading comma in object at offset " + String(cursor)
-        )
-    if cursor >= n:
-        raise Error("Stage 2: unterminated object")
-
-    while True:
-        var after_key: Int
-        var value_start: Int
-        var key_header: UInt64
-
-        # Local scope for `bytes` borrow so we can mutate doc later.
-        var bytes = doc.input.as_bytes()
-        if bytes[cursor] != UInt8(ord('"')):
-            raise Error(
-                "Stage 2: expected string key at offset " + String(cursor)
-            )
-
-        # Stage 1 emits both quote positions for the key.
-        if pos_idx + 1 >= len(positions) or Int(positions[pos_idx]) != cursor:
-            raise Error("Stage 2: cursor desync at object key")
-        var key_close = Int(positions[pos_idx + 1])
-        pos_idx += 2
-
-        var key_start = cursor + 1
-        var key_len = key_close - key_start
-        var has_escape = _string_has_escape(bytes, key_start, key_close)
-
-        if has_escape:
-            # Slow path: keys with escapes still need allocation +
-            # interning. They're rare on real JSON corpora.
-            _validate_escapes(bytes, key_start, key_close)
-            var unesc = unescape_json_string_span(bytes, key_start, key_close)
-            var key = String(unsafe_from_utf8=unesc^)
-            var key_pool_idx = len(doc.key_pool)
-            doc.key_pool.append(key^)
-            key_header = pack_tape_entry(TAPE_TAG_KEY, UInt64(key_pool_idx))
-        else:
-            # Fast path: zero-copy KEY_INLINE -- store (offset, length)
-            # into input. No allocation, no memcpy, no key_pool append.
-            key_header = pack_tape_entry(
-                TAPE_TAG_KEY_INLINE,
-                pack_pair(UInt64(key_start), UInt64(key_len)),
-            )
-
-        # Find the colon while we still have the bytes borrow.
-        after_key = _skip_ws(bytes, key_close + 1, n)
-        if after_key >= n or bytes[after_key] != UInt8(ord(":")):
-            raise Error(
-                "Stage 2: missing ':' between key and value at offset "
-                + String(after_key)
-            )
-        value_start = _skip_ws(bytes, after_key + 1, n)
-        if value_start >= n:
-            raise Error(
-                "Stage 2: missing value after ':' at offset "
-                + String(after_key)
-            )
-
-        headers_scratch.append(key_header)
-
-        if pos_idx >= len(positions) or Int(positions[pos_idx]) != after_key:
-            raise Error("Stage 2: cursor desync at object colon")
-        pos_idx += 1
-
-        var v_end = value_start
-        var value_header = _emit_value(
-            doc,
-            positions,
-            pos_idx,
-            headers_scratch,
-            v_end,
-            value_start,
-            n,
-        )
-        headers_scratch.append(value_header)
-
-        var bytes2 = doc.input.as_bytes()
-        var j = _skip_ws(bytes2, v_end, n)
-        if j >= n:
-            raise Error("Stage 2: unterminated object")
-
-        var b = bytes2[j]
-        if b == UInt8(ord("}")):
-            if pos_idx >= len(positions) or Int(positions[pos_idx]) != j:
-                raise Error("Stage 2: cursor desync at object close")
-            pos_idx += 1
-            value_end = j + 1
-            break
-
-        if b != UInt8(ord(",")):
-            raise Error(
-                "Stage 2: expected ',' or '}' in object at offset " + String(j)
-            )
-        if pos_idx >= len(positions) or Int(positions[pos_idx]) != j:
-            raise Error("Stage 2: cursor desync at object comma")
-        pos_idx += 1
-
-        var next_cursor = _skip_ws(bytes2, j + 1, n)
-        if next_cursor >= n:
-            raise Error(
-                "Stage 2: trailing comma in object at offset " + String(j)
-            )
-        if bytes2[next_cursor] == UInt8(ord("}")):
-            raise Error(
-                "Stage 2: trailing comma in object at offset " + String(j)
-            )
-        cursor = next_cursor
-
-    var total = len(headers_scratch) - headers_lo
-    var pair_count = total // 2
-    var child_start = len(doc.tape)
-    if total > 0:
-        doc.tape.resize(child_start + total, 0)
-        memcpy(
-            dest=doc.tape.unsafe_ptr() + child_start,
-            src=headers_scratch.unsafe_ptr() + headers_lo,
-            count=total,
-        )
-    headers_scratch.shrink(headers_lo)
-
-    return pack_tape_entry(
-        TAPE_TAG_OBJECT,
-        pack_pair(UInt64(pair_count), UInt64(child_start)),
-    )

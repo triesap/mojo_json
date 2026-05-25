@@ -1,21 +1,11 @@
-# GPU tape adapter (v0.2 Phase D).
+# GPU tape adapter.
 #
 # Converts a `JSONResult` produced by the GPU kernel plus the original
-# input bytes into a `Value` by feeding stage 2 of the v0.2 CPU pipeline.
+# input bytes into a `Value` by feeding stage 2 of the CPU pipeline.
 #
-# Why this exists
-# ---------------
-# v0.1's `_parse_gpu` flow was:
-#
-#     GPU -> JSONResult (positions of `{}[]:,` outside strings)
-#         -> JSONIterator (walks bytes byte-by-byte to find keys/commas)
-#         -> _build_array / _build_object (re-scan raw substring on CPU)
-#
-# That re-scan in `_build_array` / `_build_object` (parser.mojo) duplicated
-# work the GPU had already done and lived in code paths separate from the
-# CPU parser. v0.2 consolidates Value construction in `cpu/stage2.mojo`,
-# which walks a `StructuralIndex`. This adapter bridges the GPU output to
-# that pipeline.
+# Value construction is centralised in `cpu/stage2.mojo`, which walks
+# a `StructuralIndex`. This adapter bridges the GPU output to that
+# pipeline so CPU and GPU paths produce identical tape layouts.
 #
 # Reusing GPU work
 # ----------------

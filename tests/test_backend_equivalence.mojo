@@ -3,8 +3,8 @@
 # Both the default Mojo native parser (`target="cpu"`) and the simdjson
 # FFI parser (`target="cpu-simdjson"`) must produce structurally
 # identical `Value` trees and identical `dumps()` output for the same
-# input. As Phase C reworks the native parser into a two-pass tape
-# build, this test guards against drift between the two implementations.
+# input. This test guards against drift between the two
+# implementations.
 
 from std.testing import assert_true, TestSuite
 
@@ -18,9 +18,9 @@ from json import loads, dumps, Value
 
 def _values_equal(a: Value, b: Value) raises -> Bool:
     """Structural equality across two Values that may have been produced
-    by different backends. Walks arrays and objects element-wise so the
-    raw-substring storage of v0.1 doesn't false-mismatch when the two
-    backends emit semantically equal but textually different raws."""
+    by different backends. Walks arrays and objects element-wise so
+    that two backends emitting semantically equal but textually
+    different raws do not false-mismatch."""
     if a.is_null():
         return b.is_null()
     if a.is_bool():
@@ -158,8 +158,8 @@ def test_floats_in_array() raises:
 
 
 def test_unicode_string_basic() raises:
-    """ASCII-only strings, since v0.1 simdjson and native escape
-    differently on non-ASCII; we revisit normalization in Phase C."""
+    """ASCII-only strings; non-ASCII normalization across the two
+    backends is covered separately."""
     _check_equivalence('"hello world"')
     _check_equivalence('"with spaces and 123"')
 

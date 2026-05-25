@@ -261,7 +261,7 @@ def test_object_layout_nested() raises:
 
 
 # ---------------------------------------------------------------------------
-# Equivalence with the v0.1 Value tree
+# Equivalence with the canonical Value tree.
 # ---------------------------------------------------------------------------
 
 

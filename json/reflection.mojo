@@ -64,7 +64,7 @@ comptime _LIST_STRING_NAME = reflect[List[String]]().name()
 comptime _LIST_FLOAT64_NAME = reflect[List[Float64]]().name()
 comptime _LIST_BOOL_NAME = reflect[List[Bool]]().name()
 
-# v0.2 Phase F additions: Dict[String, T], nested Lists, Optional<->List combos.
+# Composite reflected types: Dict[String, T], nested Lists, Optional<->List combos.
 comptime _DICT_STRING_INT_NAME = reflect[Dict[String, Int]]().name()
 comptime _DICT_STRING_STRING_NAME = reflect[Dict[String, String]]().name()
 comptime _DICT_STRING_FLOAT64_NAME = reflect[Dict[String, Float64]]().name()
@@ -303,7 +303,7 @@ def _ser[T: AnyType](value: T) raises -> String:
         return _ser_list_float64(rebind[List[Float64]](value))
     elif tname == _LIST_BOOL_NAME:
         return _ser_list_bool(rebind[List[Bool]](value))
-    # v0.2 Phase F combinator types.
+    # Combinator types: Dict, nested List, Optional<->List combos.
     elif tname == _DICT_STRING_INT_NAME:
         return _ser_dict_string_int(rebind[Dict[String, Int]](value))
     elif tname == _DICT_STRING_STRING_NAME:
@@ -668,7 +668,7 @@ def _deser_fill[T: AnyType](mut result: T, json: Value) raises:
             ptr.bitcast[List[Bool]]().init_pointee_move(
                 _deser_list_bool(json, key)
             )
-        # ----- v0.2 Phase F combinator types -----
+        # ----- Combinator types: Dict, nested List, Optional<->List combos. -----
         elif field_type_name == _DICT_STRING_INT_NAME:
             ptr.destroy_pointee()
             ptr.bitcast[Dict[String, Int]]().init_pointee_move(
@@ -1160,61 +1160,3 @@ def _field_type_error(field: String, expected: String, got: Value) -> Error:
         + _type_label(got)
     )
 
-
-# ===================================================================
-# v0.3 redesign sketch
-# ===================================================================
-#
-# The current `_ser` / `_deser_fill` dispatch is a long if/elif chain
-# keyed on `reflect[T]().name()`. It works, but every new combinator
-# (Dict[String, T], List[Optional[T]], List[List[T]], ...) requires a
-# new precomputed name constant + ser arm + deser arm + helper trio.
-# That does not compose: List[Dict[String, List[Int]]] needs an
-# explicit entry, and so does every nested permutation.
-#
-# v0.3 should replace the name-string switch with a per-field trait
-# dispatch. Sketch:
-#
-#     trait JsonField:
-#         """One field's JSON codec. Implementations are auto-derived
-#         for primitives, Optional, List, Dict, and tuples; users can
-#         specialize for custom types without touching reflection.mojo.
-#         """
-#
-#         alias FieldType: AnyType
-#
-#         @staticmethod
-#         fn write(value: Self.FieldType, mut out: String) raises
-#
-#         @staticmethod
-#         fn read(json: Value) raises -> Self.FieldType
-#
-# Auto-derivation rules (compile-time):
-#
-#   - JsonField for Int, Int64, Bool, Float32, Float64, String, Value:
-#       built-in.
-#   - JsonField for Optional[T] where T : JsonField:
-#       null -> None, else delegate to JsonField[T].
-#   - JsonField for List[T] where T : JsonField:
-#       walk array, delegate per element.
-#   - JsonField for Dict[String, T] where T : JsonField:
-#       walk object, delegate per value.
-#   - JsonField for any reflected struct: delegate to per-field
-#       JsonField for every field, then assemble.
-#
-# This is structurally how serde works in Rust and how Pydantic v2 works
-# in Python. The win is composability: List[Dict[String, List[Int]]]
-# falls out for free, custom JsonField impls are local to the user
-# struct, and reflection.mojo shrinks to the auto-derivation glue.
-#
-# The current name-string approach stays in v0.2 because Mojo's trait
-# system does not yet support the full set of bound checks needed to
-# auto-derive JsonField generically over T : JsonField. See:
-#   - bound checks on parametric trait conformance,
-#   - default-method dispatch for parameterized traits,
-#   - lifetime/move semantics on trait return types.
-#
-# When those land, port the current arms one at a time, keeping the
-# existing tests as the contract, and delete this file's name-string
-# constants once the trait implementations cover them.
-#

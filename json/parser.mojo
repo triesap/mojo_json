@@ -163,8 +163,8 @@ def _parse_cpu[backend: StaticString = "simdjson"](s: String) raises -> Value:
     """Parse JSON using specified CPU backend.
 
     Parameters:
-        backend: "simdjson" (default, FFI) or "mojo" (v0.2 two-pass
-            native parser).
+        backend: "simdjson" (default, FFI) or "mojo" (two-pass native
+            parser).
 
     Args:
         s: JSON string to parse.
@@ -189,10 +189,10 @@ def _parse_cpu[backend: StaticString = "simdjson"](s: String) raises -> Value:
 def _parse_gpu(s: String) raises -> Value:
     """Parse JSON using the GPU pipeline.
 
-    GPU computes structural positions in parallel; the v0.2 tape adapter
-    (`gpu/tape_adapter.mojo`) merges that output with a small CPU
-    quote-only scan and feeds the result to stage 2, so Value
-    construction goes through the same code path as the CPU backends.
+    GPU computes structural positions in parallel; the tape adapter
+    (`gpu/tape_adapter.mojo`) applies the in-string filter on the
+    CPU side and feeds the result to stage 2, so Value construction
+    goes through the same code path as the CPU backends.
     """
     var data = s.as_bytes()
     var start = 0
@@ -326,11 +326,10 @@ def loads[target: StaticString = "cpu"](s: String) raises -> Value:
     elif target == "cpu-simdjson":
         return _parse_cpu["simdjson"](s)
     elif target == "gpu":
-        # As of v0.2 the GPU pipeline runs natively on NVIDIA, AMD, and
-        # Apple Metal. The Metal correctness fix lives in
-        # `gpu/kernels.mojo` (raw structural bitmap) and
-        # `gpu/tape_adapter.mojo` (CPU-side string-state filter); see
-        # `_parse_gpu` for the entry point.
+        # The GPU pipeline runs natively on NVIDIA, AMD, and Apple
+        # Metal: `gpu/kernels.mojo` emits the raw structural bitmap
+        # and `gpu/tape_adapter.mojo` applies the in-string filter
+        # CPU-side. See `_parse_gpu` for the entry point.
         return _parse_gpu(s)
     else:
         return _parse_cpu["mojo"](s)
@@ -494,7 +493,7 @@ def _list_to_array_value(values: List[Value]) raises -> Value:
 
     Serializes each element to JSON and re-parses the joined `[ ... ]`
     payload through the canonical CPU pipeline so the result is a
-    standard tape-backed view (no v0.1 raw-substring representation).
+    standard tape-backed view.
     """
     var count = len(values)
     if count == 0:
@@ -531,10 +530,11 @@ def load[
             print(event["msg"].string_value()).
 
     Note:
-        v0.2 unifies the NDJSON return type with `loads[format='ndjson']`.
-        The plain-extension auto-detection (`load("x.ndjson") -> Value`)
-        still works for backward compatibility but wraps the records in an
-        array Value. New code should prefer this typed overload.
+        This overload returns `List[Value]`, matching
+        `loads[format='ndjson']`. The plain-extension auto-detection
+        (`load("x.ndjson") -> Value`) still works for backward
+        compatibility but wraps the records in an array Value; new
+        code should prefer this typed overload.
     """
 
     comptime if format != "ndjson":

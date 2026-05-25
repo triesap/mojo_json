@@ -1,9 +1,9 @@
 # GPU loading tests
 # Tests: loads[target="gpu"](...)
 #
-# As of v0.2.0 the GPU path runs natively on NVIDIA, AMD, and Apple
-# Metal. Tests are short-circuited only on hosts without any
-# accelerator at all (CPU-only CI).
+# The GPU path runs natively on NVIDIA, AMD, and Apple Metal. Tests
+# are short-circuited only on hosts without any accelerator at all
+# (CPU-only CI).
 
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite

@@ -7,6 +7,10 @@
 # 1. Popcount: Each thread computes popcount of its 32-bit bitmap word
 # 2. Prefix Sum: Exclusive prefix sum of popcounts gives write offsets
 # 3. Scatter: Each thread writes positions using CTZ to extract set bits
+#
+# The lean pipeline only needs positions (the CPU tape adapter does
+# not consume a per-position `char_types` companion stream), so the
+# `_lean` variant below is the only public scatter path.
 
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.gpu import block_dim, block_idx, thread_idx, barrier
@@ -105,70 +109,6 @@ def add_block_offsets_kernel(
         prefix_sums[gid] = prefix_sums[gid] + block_offsets[block_id]
 
 
-# Character type encoding for bracket matching
-comptime CHAR_TYPE_OPEN_BRACE: UInt8 = 1  # {
-comptime CHAR_TYPE_CLOSE_BRACE: UInt8 = 2  # }
-comptime CHAR_TYPE_OPEN_BRACKET: UInt8 = 3  # [
-comptime CHAR_TYPE_CLOSE_BRACKET: UInt8 = 4  # ]
-comptime CHAR_TYPE_OTHER: UInt8 = 0  # : or ,
-
-
-# ===== Kernel 4: Scatter positions AND char types using bitmap and prefix offsets =====
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(Int(BLOCK_SIZE_OPT))
-    )
-)
-def scatter_positions_kernel(
-    bitmap: UnsafePointer[UInt32, MutAnyOrigin],
-    input_data: UnsafePointer[UInt8, MutAnyOrigin],
-    prefix_offsets: UnsafePointer[UInt32, MutAnyOrigin],
-    output_positions: UnsafePointer[Int32, MutAnyOrigin],
-    output_char_types: UnsafePointer[UInt8, MutAnyOrigin],
-    num_words: UInt,
-    max_byte_pos: UInt,
-):
-    """Extract and scatter positions + char types from bitmap using prefix offsets.
-    """
-    var gid = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
-    if gid >= Int(num_words):
-        return
-
-    var bits = bitmap[gid]
-    if bits == 0:
-        return
-
-    var base_pos = gid * 32
-    var write_idx = Int(prefix_offsets[gid])
-
-    # Extract positions using CTZ
-    while bits != 0:
-        # Count trailing zeros to find next set bit
-        var tz = _ctz32_gpu(bits)
-        var pos = base_pos + Int(tz)
-
-        if pos < Int(max_byte_pos):
-            output_positions[write_idx] = Int32(pos)
-
-            # Read char and encode type for fast bracket matching
-            var c = input_data[pos]
-            var char_type: UInt8 = CHAR_TYPE_OTHER
-            if c == 0x7B:  # {
-                char_type = CHAR_TYPE_OPEN_BRACE
-            elif c == 0x7D:  # }
-                char_type = CHAR_TYPE_CLOSE_BRACE
-            elif c == 0x5B:  # [
-                char_type = CHAR_TYPE_OPEN_BRACKET
-            elif c == 0x5D:  # ]
-                char_type = CHAR_TYPE_CLOSE_BRACKET
-            output_char_types[write_idx] = char_type
-
-            write_idx += 1
-
-        # Clear lowest set bit
-        bits = bits & (bits - 1)
-
-
 def _ctz32_gpu(value: UInt32) -> UInt32:
     """Count trailing zeros (GPU version)."""
     if value == 0:
@@ -262,167 +202,20 @@ def _compute_block_prefix_sums(
     )
 
 
-# ===== Main function: GPU stream compaction =====
-def extract_positions_gpu(
-    ctx: DeviceContext,
-    d_bitmap_ptr: UnsafePointer[UInt32, MutAnyOrigin],
-    d_input_ptr: UnsafePointer[UInt8, MutAnyOrigin],
-    num_words: Int,
-    max_byte_pos: Int,
-) raises -> Tuple[List[Int32], List[UInt8], Int]:
-    """Extract positions and char types from bitmap using GPU stream compaction.
-
-    Args:
-        ctx: GPU device context.
-        d_bitmap_ptr: Device pointer to structural bitmap.
-        d_input_ptr: Device pointer to input JSON data.
-        num_words: Number of 32-bit words in bitmap.
-        max_byte_pos: Maximum valid byte position.
-
-    Returns:
-        Tuple of (list of positions, list of char types, total count).
-    """
-    var num_blocks = ceildiv(num_words, BLOCK_SIZE_OPT)
-
-    # Phase 1: Compute popcounts
-    var d_popcounts = ctx.enqueue_create_buffer[DType.uint32](num_words)
-    ctx.enqueue_function_unchecked[popcount_kernel](
-        d_bitmap_ptr,
-        d_popcounts.unsafe_ptr(),
-        UInt(num_words),
-        grid_dim=num_blocks,
-        block_dim=BLOCK_SIZE_OPT,
-    )
-
-    # Phase 2: Parallel hierarchical exclusive prefix sum of popcounts.
-    #
-    # Step 2a: Launch one block per `BLOCK_SIZE_OPT` words and compute a
-    # block-local exclusive scan using `block.prefix_sum`. Each block writes
-    # its running total to `d_block_totals[block_id]`.
-    var d_prefix = ctx.enqueue_create_buffer[DType.uint32](num_words)
-    var d_block_totals = ctx.enqueue_create_buffer[DType.uint32](num_blocks)
-    d_block_totals.enqueue_fill(0)
-
-    ctx.enqueue_function_unchecked[prefix_sum_kernel](
-        d_popcounts.unsafe_ptr(),
-        d_prefix.unsafe_ptr(),
-        d_block_totals.unsafe_ptr(),
-        UInt(num_words),
-        grid_dim=num_blocks,
-        block_dim=BLOCK_SIZE_OPT,
-    )
-
-    # Step 2b: If there is more than one block, build global offsets by
-    # exclusive-scanning the block totals (recursively, to support any size)
-    # and add the per-block offset into every element of `d_prefix`.
-    var total_count: Int
-    if num_blocks == 1:
-        # Single block already holds a full exclusive scan in `d_prefix`; the
-        # block's running total is the grand total.
-        ctx.synchronize()
-        var h_block_totals = ctx.enqueue_create_host_buffer[DType.uint32](
-            num_blocks
-        )
-        ctx.enqueue_copy(h_block_totals, d_block_totals)
-        ctx.synchronize()
-        total_count = Int(h_block_totals.unsafe_ptr()[0])
-    else:
-        var d_block_prefix = ctx.enqueue_create_buffer[DType.uint32](num_blocks)
-        d_block_prefix.enqueue_fill(0)
-
-        _compute_block_prefix_sums(
-            ctx,
-            d_block_totals.unsafe_ptr(),
-            d_block_prefix.unsafe_ptr(),
-            num_blocks,
-        )
-
-        ctx.enqueue_function_unchecked[add_block_offsets_kernel](
-            d_prefix.unsafe_ptr(),
-            d_block_prefix.unsafe_ptr(),
-            UInt(num_words),
-            grid_dim=num_blocks,
-            block_dim=BLOCK_SIZE_OPT,
-        )
-
-        # Grand total = last block's exclusive offset + last block's total.
-        ctx.synchronize()
-        var h_block_totals = ctx.enqueue_create_host_buffer[DType.uint32](
-            num_blocks
-        )
-        var h_block_prefix = ctx.enqueue_create_host_buffer[DType.uint32](
-            num_blocks
-        )
-        ctx.enqueue_copy(h_block_totals, d_block_totals)
-        ctx.enqueue_copy(h_block_prefix, d_block_prefix)
-        ctx.synchronize()
-        total_count = Int(h_block_prefix.unsafe_ptr()[num_blocks - 1]) + Int(
-            h_block_totals.unsafe_ptr()[num_blocks - 1]
-        )
-
-    if total_count == 0:
-        return (List[Int32](), List[UInt8](), 0)
-
-    # Phase 3: Scatter positions and char types
-    var d_positions = ctx.enqueue_create_buffer[DType.int32](total_count)
-    var d_char_types = ctx.enqueue_create_buffer[DType.uint8](total_count)
-    d_positions.enqueue_fill(0)
-    d_char_types.enqueue_fill(0)
-
-    ctx.enqueue_function_unchecked[scatter_positions_kernel](
-        d_bitmap_ptr,
-        d_input_ptr,
-        d_prefix.unsafe_ptr(),
-        d_positions.unsafe_ptr(),
-        d_char_types.unsafe_ptr(),
-        UInt(num_words),
-        UInt(max_byte_pos),
-        grid_dim=num_blocks,
-        block_dim=BLOCK_SIZE_OPT,
-    )
-
-    # Copy back to host
-    var h_positions = ctx.enqueue_create_host_buffer[DType.int32](total_count)
-    var h_char_types = ctx.enqueue_create_host_buffer[DType.uint8](total_count)
-    ctx.enqueue_copy(h_positions, d_positions)
-    ctx.enqueue_copy(h_char_types, d_char_types)
-    ctx.synchronize()
-
-    # Convert to Lists
-    var positions = List[Int32](capacity=total_count)
-    positions.resize(total_count, 0)
-    memcpy(
-        dest=positions.unsafe_ptr(),
-        src=h_positions.unsafe_ptr(),
-        count=total_count,
-    )
-
-    var char_types = List[UInt8](capacity=total_count)
-    char_types.resize(total_count, 0)
-    memcpy(
-        dest=char_types.unsafe_ptr(),
-        src=h_char_types.unsafe_ptr(),
-        count=total_count,
-    )
-
-    return (positions^, char_types^, total_count)
-
-
 def extract_positions_gpu_lean(
     ctx: DeviceContext,
     d_bitmap_ptr: UnsafePointer[UInt32, MutAnyOrigin],
     num_words: Int,
     max_byte_pos: Int,
 ) raises -> List[Int32]:
-    """Stream-compact a structural bitmap into a position list, no char_types.
+    """Stream-compact a structural bitmap into a position list.
 
-    Same algorithm as `extract_positions_gpu` but skips the char_types
-    output buffer + D2H copy. Used by the v0.2 Apple Metal lean
-    pipeline, where `tape_adapter` only consumes structural positions
-    (the v0.1 bracket-matcher's char_types are dead work).
+    Positions-only: the tape adapter
+    (`gpu/tape_adapter.parse_gpu_to_value`) only consumes
+    `result.structural`, so neither a per-position `char_types`
+    companion stream nor a `pair_pos` array is produced here.
 
-    Returns just the positions list (caller already knows
-    `max_byte_pos`).
+    Returns the positions list; caller already knows `max_byte_pos`.
     """
     var num_blocks = ceildiv(num_words, BLOCK_SIZE_OPT)
 
@@ -533,11 +326,12 @@ def scatter_positions_lean_kernel(
     num_words: UInt,
     max_byte_pos: UInt,
 ):
-    """Lean scatter -- positions only, no char-type lookup.
+    """Scatter set-bit byte positions out of a 32-bit-per-word bitmap.
 
-    Skips the input-data load + char-type encoding done by
-    `scatter_positions_kernel`. Saves one byte read per emitted
-    position and one byte write to the char_types buffer.
+    Each thread owns one 32-bit word; CTZ extracts set-bit indices in
+    ascending order and writes them at `prefix_offsets[gid]`. No
+    input byte load and no companion byte-type output buffer -- the
+    tape adapter recomputes character classes from the input bytes.
     """
     var gid = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
     if gid >= Int(num_words):

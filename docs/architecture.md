@@ -1,10 +1,10 @@
 # Architecture
 
-In v0.2 the library is built around a single in-memory representation:
-a tape-backed `Document` plus a lightweight `Value` view. Every CPU and
-GPU pipeline funnels into the same shape, so the rest of the library
-(LazyValue, JSONPath, JSON Patch, schema validation, reflection serde)
-operates on one model.
+The library is built around a single in-memory representation: a
+tape-backed `Document` plus a lightweight `Value` view. Every CPU
+and GPU pipeline funnels into the same shape, so the rest of the
+library (LazyValue, JSONPath, JSON Patch, schema validation,
+reflection serde) operates on one model.
 
 ## System Overview
 
@@ -41,18 +41,18 @@ graph TB
     document --> dumps
 ```
 
-`target='gpu'` runs natively on NVIDIA, AMD, and Apple Metal. The
-Apple Metal path emits the raw `{}[]:,` bitmap from
-`fused_json_kernel` and lets `gpu/tape_adapter.mojo` apply the
-in-string filter on the CPU side, which sidesteps the cross-chunk
-escape edge cases that the GPU-side mask would otherwise miss. Apple
-Metal also runs a lean variant that drops the popcount and
-hierarchical prefix-sum stages and the CPU bracket-match pass,
-because the v0.2 tape adapter does not consume `pair_pos`.
+`target='gpu'` runs natively on NVIDIA, AMD, and Apple Metal. All
+three backends share the same lean pipeline: `fused_json_kernel`
+emits the raw `{}[]:,` structural bitmap, stream compaction
+extracts positions, and `gpu/tape_adapter.mojo` applies the
+in-string filter on the CPU side using the same byte walk that
+stage 2 needs. There is no GPU-side in-string mask and no CPU
+bracket-matching pass -- the tape adapter consumes only
+`gpu_result.structural`.
 
 ## CPU Backends
 
-### Pure Mojo Backend (Default) -- v0.2 two-pass parser
+### Pure Mojo Backend (Default) -- two-pass parser
 
 **Implementation:** Stage 1 builds a structural index of every byte
 offset whose character is `{ } [ ] : , "` (outside string literals).
@@ -77,7 +77,7 @@ bytes for structure.
   scalar produce byte-identical position lists, including a
   full-document run against the benchmark corpora.
 
-**Performance (Apple Silicon, M-series; `pixi run -e dev bench-cpu`):**
+**Performance (`pixi run -e dev bench-cpu`):**
 
 Both benches use the same protocol: 3 warmup + 100 measured
 iterations, min-time-derived throughput. The bench reports two
@@ -87,17 +87,11 @@ workloads per parser:
 * `parse_traverse`: parse + recursively visit every leaf via
   the public `Value` API.
 
-| Corpus | Size | simdjson `parse_only` | mojo `parse_only` | simdjson `parse_traverse` | mojo `parse_traverse` |
-|---|---|---|---|---|---|
-| `twitter.json` | 616 KB | 0.235 ms / 2.68 GB/s | 0.54 ms / 1.17 GB/s | 0.236 ms / 2.67 GB/s | 1.12 ms / 0.57 GB/s |
-| `citm_catalog.json` | 1.7 MB | 0.440 ms / 3.92 GB/s | 1.09 ms / 1.58 GB/s | 0.528 ms / 3.27 GB/s | 2.49 ms / 0.69 GB/s |
-
 `parse_traverse` only adds a small constant on top of `parse_only`
 on the Mojo side because every `Value` is a stable tape index, so
-iteration is a tape walk and not a re-parse. The remaining 2.3-2.5x
-to native simdjson on `parse_only` is algorithmic (no Eisel-Lemire
-float fast path, recursive emission rather than a flat tape walker,
-no AVX-512 64-byte chunks). Full breakdown in
+iteration is a tape walk and not a re-parse. The remaining gap to
+native simdjson on `parse_only` is algorithmic (no Eisel-Lemire
+float fast path, no AVX-512 64-byte chunks). Full breakdown in
 [performance.md](./performance.md).
 
 **Usage:**
@@ -152,38 +146,36 @@ var data = loads[target="cpu-simdjson"]('{"key": "value"}')
 
 **Performance (804 MB `twitter_large_record.json`):**
 
-| Platform | Throughput | vs cuJSON | Pipeline |
-|---|---:|---|---|
-| AMD MI355X | 13 GB/s | 3.6x | single-shot |
-| NVIDIA B200 | 8 GB/s | 1.8x | single-shot |
-| Apple M3 Pro | 3.1 GB/s | n/a | lean Metal |
+| Platform | Throughput | Pipeline |
+|---|---:|---|
+| AMD MI355X | 13 GB/s | lean (single-shot) |
+| NVIDIA B200 | ~6.5 GB/s | lean (single-shot, pinned wall-clock) |
+| Apple M3 Pro | 3.1 GB/s | lean Metal (chunked) |
 
 **Techniques:**
-- Bitmap-based parsing
-- Parallel prefix sums
-- GPU stream compaction for position extraction
-- Hybrid GPU/CPU pipeline (Apple Metal: in-string filter on CPU)
+- One fused kernel emits the raw `{}[]:,` structural bitmap.
+- Positions-only stream compaction (popcount + block prefix sum + scatter).
+- CPU-side escape state machine in `gpu/tape_adapter.mojo` --
+  the same byte walk that stage 2 already needs.
 
 ### GPU Pipeline
 
 ```mermaid
 flowchart LR
-    subgraph "Phase 1: Transfer"
+    subgraph "Transfer"
         A[JSON Bytes] -->|H2D| B[GPU Memory]
     end
 
-    subgraph "Phase 2: GPU Kernels"
-        B --> C[Quote Detection]
-        C --> D[Prefix Sum]
-        D --> E[Structural Bitmap]
+    subgraph "GPU Kernels"
+        B --> E[Fused structural bitmap]
     end
 
-    subgraph "Phase 3: Extract"
+    subgraph "Extract"
         E --> F[Stream Compaction]
         F --> G[Position Array]
     end
 
-    subgraph "Phase 4: Build"
+    subgraph "Build (CPU)"
         G --> H[gpu/tape_adapter.parse_gpu_to_value]
         H --> I[Value via Stage 2]
     end
@@ -194,21 +186,18 @@ flowchart LR
 
 ### GPU Parsing Flow
 
-1. **Host-to-Device Transfer:** Copy JSON bytes to GPU using pinned memory (HostBuffer) for fast transfer (~15ms for 804MB)
-2. **GPU Kernels:** Execute parallel kernels to:
-   - Create bitmaps for quotes, escapes, structural characters
-   - Compute parallel prefix sums to identify in-string regions
-   - Extract structural character bitmap
-3. **Stream Compaction (GPU):** Extract only the positions of structural characters (~50ms)
-4. **Device-to-Host Transfer:** Copy compact position array back to CPU
-5. **Tape Adapter (CPU):** `gpu/tape_adapter.parse_gpu_to_value` merges the GPU `{ } [ ] : ,` positions with a small CPU quote-only scan to produce a stage1-compatible `StructuralIndex`, then runs **stage 2** to write tape entries into a `Document`.
+1. **Host-to-Device Transfer:** Copy JSON bytes to GPU using pinned memory (HostBuffer) for fast transfer (~15 ms for 804 MB).
+2. **Fused GPU Kernel:** One kernel emits the raw `{}[]:,` structural bitmap (and the `{}[]` open-close bitmap, currently reserved for future use). The GPU does not build an in-string mask.
+3. **Stream Compaction (GPU):** Extract only the positions of structural characters via popcount + block prefix sum + scatter (~95 ms on B200 at 804 MB).
+4. **Device-to-Host Transfer:** Copy compact position array back to CPU.
+5. **Tape Adapter (CPU):** `gpu/tape_adapter.parse_gpu_to_value` walks the byte stream once to apply the escape state machine, filtering structurals inside string literals, and runs **stage 2** to write tape entries into a `Document`.
 6. **Value:** Returned as a tape-backed view (`Value(doc, tape_idx=0)`) over that `Document`; no extra DOM construction step.
 
 ### Why Hybrid GPU/CPU?
 
-- **GPU excels at:** Parallel bitmap operations, prefix sums, stream compaction
-- **CPU excels at:** Sequential bracket matching, tree construction with dynamic memory
-- **Key insight:** GPU stream compaction dramatically reduces D2H transfer size (from 465MB to <10MB for 804MB input)
+- **GPU excels at:** Parallel bitmap operations and stream compaction.
+- **CPU excels at:** Byte-by-byte state machines (escape tracking) and tape construction with dynamic memory.
+- **Key insight:** GPU stream compaction reduces D2H transfer size (from ~465 MB to a few MB on 804 MB input), and the CPU is fast enough to apply the escape state machine while consuming the compact position array.
 
 ## Value Type
 

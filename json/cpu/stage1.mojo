@@ -1,12 +1,11 @@
 # SIMD stage 1: structural-index builder, branchless 64-byte path.
 #
 # This is the SIMD counterpart of `stage1_scalar.parse_structural_scalar`.
-# Phase 3 (parity push v0.2) replaces the per-marker scalar escape /
-# in-string state machine with branchless 64-bit bit-twiddling on each
-# 64-byte chunk:
+# Each 64-byte chunk is processed with branchless 64-bit bit-twiddling
+# instead of a per-marker scalar escape / in-string state machine:
 #
 #   1. Two PSHUFB-style nibble lookups classify every byte into one of
-#      `\" \\ { } [ ] : ,` or "non-marker" -- inherited from Phase 2.
+#      `\" \\ { } [ ] : ,` or "non-marker".
 #   2. `pack_bits` turns the per-byte category bools into three uint64
 #      bitmaps (struct, quote, bslash) for the chunk.
 #   3. `find_escape_mask64` (simdjson-style branchless escape scanner)
@@ -18,11 +17,10 @@
 #      `count_trailing_zeros` -- no per-marker branches, no per-marker
 #      classifier reads, no scalar escape resolver.
 #
-# The previous Phase-2 walker still touched `classified[bit]` once per
-# marker to dispatch on category; that's gone. The only data-dependent
-# branch in the chunk loop is the bit-iteration loop itself, which is
-# proportional to the total number of structural characters in the
-# input -- not the number of bytes scanned.
+# The only data-dependent branch in the chunk loop is the
+# bit-iteration loop itself, which is proportional to the total
+# number of structural characters in the input -- not the number of
+# bytes scanned.
 #
 # Cross-chunk state is two scalars (`prev_in_string` carry and
 # `prev_escape` carry); both are updated by simple shifts/AND at the
@@ -66,8 +64,7 @@ comptime _CAT_STRUCT_MASK: UInt8 = 0xEE
 #
 # Given a 64-byte chunk, returns a 64-byte SIMD vector where each lane
 # is the classifier byte for the corresponding input byte (0 for
-# non-markers; one of the bits above for markers). Same encoding as
-# Phase 2; the difference is the wider chunk size.
+# non-markers; one of the bits above for markers).
 # ---------------------------------------------------------------------------
 
 
@@ -137,12 +134,11 @@ def parse_structural_simd(input: String) -> StructuralIndex:
     enforced by `tests/test_stage1_equivalence.mojo`, including a
     full-document run against the benchmark corpora.
 
-    The previous Phase-2 walker spent the bulk of its time in the
-    per-marker dispatch loop deciding "is this `\\` an escape, is this
-    `\"` already escaped, is this `,` inside a string?". Phase 3 turns
-    all of those questions into branchless bit-twiddling on the
-    per-chunk uint64 masks, leaving just one loop -- iterating set
-    bits in the final emit mask with `count_trailing_zeros`.
+    The expensive per-marker questions ("is this `\\` an escape,
+    is this `\"` already escaped, is this `,` inside a string?")
+    become branchless bit-twiddling on the per-chunk uint64 masks,
+    leaving just one loop -- iterating set bits in the final emit
+    mask with `count_trailing_zeros`.
     """
     var bytes = input.as_bytes()
     var n = len(bytes)

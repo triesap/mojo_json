@@ -1,10 +1,10 @@
 # Tests for json/document.mojo
 #
-# These tests exercise the v0.2 tape representation in isolation: pack/
+# These tests exercise the tape representation in isolation: pack /
 # unpack of the bit-packed entries, the side pools, and the builder
 # helpers on `Document`. They do NOT depend on `Value` or any parser --
-# they verify only that the storage primitive that Phase B (COW) and
-# Phase C (SIMD parser) build on is sound.
+# they verify only that the storage primitive everything else builds
+# on is sound.
 
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
@@ -212,9 +212,9 @@ def test_root_points_at_last_entry() raises:
 def test_multi_view_consistency() raises:
     """Reading the same tape index twice returns the same logical value.
 
-    This is the foundational property Phase B's `Value` view will rely
-    on: two `Value`s pointing at the same `(Document, tape_idx)` must
-    observe identical content.
+    Two `Value`s pointing at the same `(Document, tape_idx)` must
+    observe identical content; this is the foundational property the
+    `Value` view relies on.
     """
     var d = Document(String('"foo"'))
     var idx = d.append_string(1, 3)  # "foo"
@@ -227,9 +227,9 @@ def test_multi_view_consistency() raises:
 def test_document_copy_is_independent() raises:
     """Document.copy() yields an independent document.
 
-    Mutating one must not affect the other; this guards Phase B's
-    materialization where an OwnedValue clones the tape on first
-    write.
+    Mutating one must not affect the other; this guards the
+    copy-on-write materialization where an `OwnedValue` clones the
+    tape on first write.
     """
     var d1 = Document(String("[1]"))
     _ = d1.append_int(1)

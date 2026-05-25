@@ -1,77 +1,93 @@
-# Optimized JSON Parser - GPU-accelerated with fully parallel prefix sums
+# GPU JSON parser entry points -- unified lean pipeline.
 #
-# Key optimizations:
-# 1. Fully GPU-parallel hierarchical prefix sums (no CPU loop!)
-# 2. Pinned memory for faster H2D transfers
-# 3. Minimal host-device synchronization
-# 4. Fused kernels
+# Both `parse_json_gpu` (owns its input) and
+# `parse_json_gpu_from_pinned` (caller hands us an already-pinned host
+# buffer) funnel into the same `_parse_lean` core. The core launches a
+# single `fused_json_kernel`, runs positions-only stream compaction
+# (`extract_positions_gpu_lean`), and returns a `JSONResult` whose
+# `pair_pos` is a -1-filled placeholder kept for legacy-iterator ABI
+# compatibility.
+#
+# Why "lean"
+# ----------
+# `gpu/kernels.mojo:fused_json_kernel` intentionally emits the raw
+# `{}[]:,` bitmap and ignores the `quote_prefix_in` argument (the
+# correct, byte-by-byte escape state machine lives in
+# `gpu/tape_adapter._result_to_index` on the CPU side). That makes the
+# popcount + hierarchical prefix-sum cascade that used to feed
+# `quote_prefix_in` pure dead work; the CPU `_match_brackets_fast` pass
+# that built `pair_pos` is also dead because `parse_gpu_to_value` only
+# consumes `gpu_result.structural`. The Apple Metal path proved this
+# out; this revision makes the same pipeline canonical on NVIDIA / AMD.
+#
+# Per-input footprint drops from ~9 device buffers to 4 and the wall
+# clock loses the CPU bracket-match phase (~100+ ms on
+# twitter_large_record on B200). On Apple unified-memory hosts where
+# 800 MB inputs used to crash the host, the chunked variant still lives
+# behind `JSON_GPU_APPLE_CHUNK_MB` (default 64 MB; opt-out via
+# `JSON_GPU_APPLE_NO_CHUNK=1` for single-shot A/B).
+#
+# Note: `fused_json_kernel`'s signature still takes a `quote_prefix_in`
+# pointer (kept stable so a correct GPU-side escape implementation can
+# drop in later). We pass a dedicated `d_quote_dummy` device buffer that
+# nothing reads for correctness -- Metal AOT rejects aliasing with a
+# write target, so it cannot be reused for any of the output buffers.
 
 from std.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from std.gpu import block_dim, block_idx, thread_idx, barrier, global_idx
 from std.gpu.globals import MAX_THREADS_PER_BLOCK_METADATA
-from std.gpu.primitives import block
-from std.gpu.memory import AddressSpace
 from std.collections import List
 from std.memory import UnsafePointer, memcpy
 from std.math import ceildiv
-from std.sys import has_accelerator, has_apple_gpu_accelerator
+from std.sys import has_accelerator
 from std.time import perf_counter_ns
 from std.utils.static_tuple import StaticTuple
 
 from ..types import JSONInput, JSONResult
-from .kernels import (
-    BLOCK_SIZE_OPT,
-    popcount_fast,
-    fused_json_kernel,
-    structural_popcount_kernel,
-    extract_positions_kernel,
-)
-from .stream_compact import extract_positions_gpu, extract_positions_gpu_lean
+from .kernels import BLOCK_SIZE_OPT, fused_json_kernel
+from .stream_compact import extract_positions_gpu_lean
 
 
 def parse_json_gpu(
     var input: JSONInput, verbose: Bool = False
 ) raises -> JSONResult:
-    """GPU JSON parsing with parallel algorithms.
+    """Parse a JSON document on the GPU. Allocates its own
+    DeviceContext + pinned host buffer.
 
     Args:
         input: Owned byte buffer with the JSON document.
         verbose: If True, print per-phase timings to stdout. Useful for
-            profiling with `pixi run bench-gpu -- --debug-timing <file>`.
+            `pixi run bench-gpu -- --debug-timing <file>`.
+
+    Returns:
+        `JSONResult` whose `structural` carries the in-order
+        `{ } [ ] : ,` byte offsets (the GPU side does not classify
+        in-string bytes; `gpu/tape_adapter` does that on the CPU).
+        `pair_pos` is a -1-filled placeholder.
     """
     comptime if not has_accelerator():
         raise Error(
             "parse_json_gpu requires a supported accelerator at compile"
-            " time. None was detected on this host (Mojo's has_accelerator()"
+            " time. None was detected on this host (has_accelerator()"
             " returned False). Use loads(...) without target='gpu' to run"
             " on the CPU backend."
         )
 
     var size = len(input.data)
-
     if size == 0:
         var result = JSONResult()
         return result^
 
     var total_padded_32 = (size + 31) // 32
-
     var ctx = DeviceContext()
-    comptime if has_apple_gpu_accelerator():
-        # Apple Metal lean pipeline: `fused_json_kernel` discards
-        # `quote_prefix_in` (cross-chunk and escaped-quote correctness
-        # moved to `tape_adapter._result_to_index` on the CPU side),
-        # so the popcount + hierarchical prefix-sum stages from the
-        # NVIDIA / AMD path are dead work on Apple. We also skip the
-        # CPU `_match_brackets_fast` step because the v0.2 tape
-        # adapter doesn't consume `pair_pos`. That removes ~30% of
-        # GPU work, 5 device buffers, and the largest CPU phase from
-        # each launch.
-        return _parse_json_gpu_apple_lean(
-            ctx, input^, size, total_padded_32, verbose
-        )
-    return _parse_json_gpu_optimized(
-        ctx, input^, size, total_padded_32, verbose
-    )
+
+    var t0 = perf_counter_ns()
+    var d_input = ctx.enqueue_create_buffer[DType.uint8](size)
+    var h_input = ctx.enqueue_create_host_buffer[DType.uint8](size)
+    memcpy(dest=h_input.unsafe_ptr(), src=input.data.unsafe_ptr(), count=size)
+    ctx.enqueue_copy(d_input, h_input)
+
+    return _parse_lean(ctx, d_input, size, total_padded_32, t0, verbose)
 
 
 def parse_json_gpu_from_pinned(
@@ -80,22 +96,22 @@ def parse_json_gpu_from_pinned(
     size: Int,
     verbose: Bool = False,
 ) raises -> JSONResult:
-    """GPU JSON parsing from pre-loaded pinned memory (fastest path).
-
-    This skips the memcpy to pinned memory, saving ~100ms for large files.
-    Use this when you can read the file directly into pinned memory.
+    """Parse a JSON document on the GPU from a caller-owned pinned host
+    buffer. Skips the host->pinned memcpy + DeviceContext setup, which
+    is the steady-state hot path (e.g. the bench harness).
 
     Args:
-        ctx: Device context (reused across calls).
-        h_input: Pinned host buffer with the JSON document already copied in.
+        ctx: Device context (reused across calls in production).
+        h_input: Pinned host buffer with the JSON document already
+            copied in.
         size: Length of the document in bytes.
         verbose: If True, print per-phase timings to stdout.
     """
     comptime if not has_accelerator():
         raise Error(
             "parse_json_gpu_from_pinned requires a supported accelerator at"
-            " compile time. None was detected on this host (Mojo's"
-            " has_accelerator() returned False)."
+            " compile time. None was detected on this host"
+            " (has_accelerator() returned False)."
         )
 
     if size == 0:
@@ -103,37 +119,25 @@ def parse_json_gpu_from_pinned(
         return result^
 
     var total_padded_32 = (size + 31) // 32
-    return _parse_json_gpu_from_pinned_impl(
-        ctx, h_input, size, total_padded_32, verbose
-    )
+
+    var t0 = perf_counter_ns()
+    var d_input = ctx.enqueue_create_buffer[DType.uint8](size)
+    ctx.enqueue_copy(d_input, h_input)
+
+    return _parse_lean(ctx, d_input, size, total_padded_32, t0, verbose)
 
 
-def _parse_json_gpu_apple_lean(
+def _parse_lean(
     ctx: DeviceContext,
-    var input: JSONInput,
+    d_input: DeviceBuffer[DType.uint8],
     size: Int,
     total_padded_32: Int,
+    t0: UInt,
     verbose: Bool,
 ) raises -> JSONResult:
-    """Apple Metal lean pipeline.
-
-    Drops the four kernel launches and five device buffers that the
-    NVIDIA / AMD path uses for in-string detection -- the
-    correctness path moved to `tape_adapter._result_to_index` so
-    the GPU-side popcount + prefix-sum work is dead. Also skips the
-    CPU `_match_brackets_fast` pass because the v0.2 tape adapter
-    only consumes `result.structural`, never `result.pair_pos`.
-
-    Per-input footprint reduces from ~7x size to ~3x size, and
-    per-input wall-clock drops by the time previously spent on
-    bracket matching (~50% on twitter_large_record).
-
-    Notes for future readers: `fused_json_kernel`'s body reads
-    `quote_prefix_in[global_id]` once and discards it. Metal AOT
-    does buffer-binding alias analysis and rejects the kernel if
-    that pointer aliases a write target, so we allocate a small
-    dedicated `d_quote_dummy` buffer instead. It's never read for
-    correctness; whatever the device leaves in there is fine.
+    """Lean kernel + extract. Single fused kernel launch (raw
+    `{}[]:,` bitmap), positions-only stream compaction, no GPU
+    in-string mask, no CPU bracket-match pass. Used by every backend.
     """
     var result = JSONResult()
     result.file_size = size
@@ -142,23 +146,18 @@ def _parse_json_gpu_apple_lean(
     if num_blocks == 0:
         num_blocks = 1
 
-    var t0 = perf_counter_ns()
-
-    var d_input = ctx.enqueue_create_buffer[DType.uint8](size)
-    var h_input = ctx.enqueue_create_host_buffer[DType.uint8](size)
-    memcpy(dest=h_input.unsafe_ptr(), src=input.data.unsafe_ptr(), count=size)
-    ctx.enqueue_copy(d_input, h_input)
-
     var d_structural = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
     var d_open_close = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
-    # See docstring for why this exists. Read-only dummy for the
-    # kernel's `quote_prefix_in` parameter.
+    # Read-only dummy for `fused_json_kernel`'s `quote_prefix_in`
+    # parameter (the kernel reads it once and discards; Metal AOT
+    # rejects aliasing with a write target so it must be its own
+    # buffer).
     var d_quote_dummy = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
 
     if verbose:
         ctx.synchronize()
         var t_h2d = perf_counter_ns()
-        print("    [lean] H2D + alloc:", Float64(t_h2d - t0) / 1e6, "ms")
+        print("    H2D + alloc:", Float64(t_h2d - t0) / 1e6, "ms")
 
     ctx.enqueue_function_unchecked[fused_json_kernel](
         d_input.unsafe_ptr(),
@@ -174,20 +173,21 @@ def _parse_json_gpu_apple_lean(
     ctx.synchronize()
     var t1 = perf_counter_ns()
     if verbose:
-        print("    [lean] fused kernel:", Float64(t1 - t0) / 1e6, "ms")
+        print("    fused kernel:", Float64(t1 - t0) / 1e6, "ms (cumulative)")
 
-    # Lean extractor: positions only, skips char_types entirely
-    # (scatter kernel work + 66 MB D2H on twitter_large_record).
+    # Positions-only stream compaction: skips the char_types scatter
+    # + D2H copy (~66 MB on twitter_large_record) since
+    # `_match_brackets_fast` is gone.
     result.structural = extract_positions_gpu_lean(
         ctx,
         d_structural.unsafe_ptr(),
         total_padded_32,
         size,
     )
-    # `pair_pos` is unused by the v0.2 tape adapter, but downstream
-    # code still indexes it for legacy iterator compatibility. Empty
-    # list with capacity matching structural count is enough -- we
-    # never write to it on this path.
+    # `pair_pos` is unused by `gpu/tape_adapter.parse_gpu_to_value`,
+    # but downstream legacy-iterator code still indexes it. A
+    # -1-filled list sized to `structural` keeps that ABI without
+    # paying for bracket matching.
     result.pair_pos = List[Int32](capacity=len(result.structural))
     result.pair_pos.resize(len(result.structural), -1)
 
@@ -196,7 +196,7 @@ def _parse_json_gpu_apple_lean(
         var total_ms = Float64(t2 - t0) / 1e6
         var gbps = (Float64(size) / 1e9) / (total_ms / 1e3)
         print(
-            "    [lean] position extract:",
+            "    position extract:",
             Float64(t2 - t1) / 1e6,
             "ms; total",
             total_ms,
@@ -208,500 +208,3 @@ def _parse_json_gpu_apple_lean(
         )
 
     return result^
-
-
-def _parse_json_gpu_optimized(
-    ctx: DeviceContext,
-    var input: JSONInput,
-    size: Int,
-    total_padded_32: Int,
-    verbose: Bool,
-) raises -> JSONResult:
-    """GPU-accelerated JSON parsing with fully parallel prefix sums."""
-    var result = JSONResult()
-    result.file_size = size
-
-    # Calculate grid dimensions
-    var num_blocks = ceildiv(total_padded_32, BLOCK_SIZE_OPT)
-    if num_blocks == 0:
-        num_blocks = 1
-
-    var t0 = perf_counter_ns()
-
-    # ===== Phase 1: Allocate and transfer input =====
-    var d_input = ctx.enqueue_create_buffer[DType.uint8](size)
-
-    # Use pinned host buffer for faster transfer
-    var h_input = ctx.enqueue_create_host_buffer[DType.uint8](size)
-
-    if verbose:
-        ctx.synchronize()
-        var t_alloc = perf_counter_ns()
-        print("    Buffer alloc:", Float64(t_alloc - t0) / 1e6, "ms")
-
-    memcpy(dest=h_input.unsafe_ptr(), src=input.data.unsafe_ptr(), count=size)
-
-    if verbose:
-        var t_memcpy = perf_counter_ns()
-        print("    memcpy:", Float64(t_memcpy - t0) / 1e6, "ms (cumulative)")
-
-    ctx.enqueue_copy(d_input, h_input)
-
-    if verbose:
-        ctx.synchronize()
-        var t_h2d = perf_counter_ns()
-        print("    H2D transfer:", Float64(t_h2d - t0) / 1e6, "ms (cumulative)")
-
-    # Allocate output buffers
-    var d_quote_bitmap = ctx.enqueue_create_buffer[DType.uint32](
-        total_padded_32
-    )
-    var d_popcounts = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
-    var d_quote_prefix = ctx.enqueue_create_buffer[DType.uint32](
-        total_padded_32
-    )
-    var d_structural = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
-    var d_open_close = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
-
-    # Note: Skipping enqueue_fill(0) - kernels overwrite all values
-
-    # ===== Phase 2: Build quote bitmap and compute popcounts =====
-    ctx.enqueue_function_unchecked[_quote_popcount_kernel](
-        d_input.unsafe_ptr(),
-        d_quote_bitmap.unsafe_ptr(),
-        d_popcounts.unsafe_ptr(),
-        UInt(size),
-        UInt(total_padded_32),
-        grid_dim=num_blocks,
-        block_dim=BLOCK_SIZE_OPT,
-    )
-
-    # ===== Phase 3: Hierarchical GPU-parallel prefix sums =====
-    # Level 0: Block-local prefix sums + block totals
-    var d_block_sums = ctx.enqueue_create_buffer[DType.uint32](num_blocks)
-
-    ctx.enqueue_function_unchecked[_block_prefix_kernel](
-        d_popcounts.unsafe_ptr(),
-        d_quote_prefix.unsafe_ptr(),
-        d_block_sums.unsafe_ptr(),
-        UInt(total_padded_32),
-        grid_dim=num_blocks,
-        block_dim=BLOCK_SIZE_OPT,
-    )
-
-    # Level 1+: If many blocks, compute prefix sums of block sums recursively
-    if num_blocks > 1:
-        # Allocate buffers for block prefix sums
-        var d_block_prefix = ctx.enqueue_create_buffer[DType.uint32](num_blocks)
-
-        var num_blocks_l1 = ceildiv(num_blocks, BLOCK_SIZE_OPT)
-
-        if num_blocks_l1 == 1:
-            # Single block can handle all block sums
-            var d_dummy = ctx.enqueue_create_buffer[DType.uint32](1)
-
-            ctx.enqueue_function_unchecked[_block_prefix_kernel](
-                d_block_sums.unsafe_ptr(),
-                d_block_prefix.unsafe_ptr(),
-                d_dummy.unsafe_ptr(),
-                UInt(num_blocks),
-                grid_dim=1,
-                block_dim=min(num_blocks, BLOCK_SIZE_OPT),
-            )
-        else:
-            # Need another level of hierarchy
-            var d_block_sums_l1 = ctx.enqueue_create_buffer[DType.uint32](
-                num_blocks_l1
-            )
-
-            ctx.enqueue_function_unchecked[_block_prefix_kernel](
-                d_block_sums.unsafe_ptr(),
-                d_block_prefix.unsafe_ptr(),
-                d_block_sums_l1.unsafe_ptr(),
-                UInt(num_blocks),
-                grid_dim=num_blocks_l1,
-                block_dim=BLOCK_SIZE_OPT,
-            )
-
-            # Level 2: prefix sum of level 1 block sums
-            var num_blocks_l2 = ceildiv(num_blocks_l1, BLOCK_SIZE_OPT)
-            var d_block_prefix_l1 = ctx.enqueue_create_buffer[DType.uint32](
-                num_blocks_l1
-            )
-
-            var d_dummy = ctx.enqueue_create_buffer[DType.uint32](1)
-
-            ctx.enqueue_function_unchecked[_block_prefix_kernel](
-                d_block_sums_l1.unsafe_ptr(),
-                d_block_prefix_l1.unsafe_ptr(),
-                d_dummy.unsafe_ptr(),
-                UInt(num_blocks_l1),
-                grid_dim=num_blocks_l2,
-                block_dim=min(num_blocks_l1, BLOCK_SIZE_OPT),
-            )
-
-            # Add L1 prefix back to L0 prefix
-            ctx.enqueue_function_unchecked[_add_block_offset_kernel](
-                d_block_prefix.unsafe_ptr(),
-                d_block_prefix_l1.unsafe_ptr(),
-                UInt(num_blocks),
-                grid_dim=num_blocks_l1,
-                block_dim=BLOCK_SIZE_OPT,
-            )
-
-        # Add block prefixes to element-level prefix sums
-        ctx.enqueue_function_unchecked[_add_block_offset_kernel](
-            d_quote_prefix.unsafe_ptr(),
-            d_block_prefix.unsafe_ptr(),
-            UInt(total_padded_32),
-            grid_dim=num_blocks,
-            block_dim=BLOCK_SIZE_OPT,
-        )
-
-    # ===== Phase 4: Main fused kernel (uses prefix sums for in-string detection) =====
-    ctx.enqueue_function_unchecked[fused_json_kernel](
-        d_input.unsafe_ptr(),
-        d_structural.unsafe_ptr(),
-        d_open_close.unsafe_ptr(),
-        d_quote_prefix.unsafe_ptr(),
-        UInt(size),
-        UInt(total_padded_32),
-        grid_dim=num_blocks,
-        block_dim=BLOCK_SIZE_OPT,
-    )
-
-    # Single sync point before copying back
-    ctx.synchronize()
-    var t1 = perf_counter_ns()
-
-    if verbose:
-        print("  H2D + GPU kernels:", Float64(t1 - t0) / 1e6, "ms")
-
-    # ===== Phase 5: Extract positions from structural bitmap (GPU stream compaction) =====
-    var gpu_result = extract_positions_gpu(
-        ctx,
-        d_structural.unsafe_ptr(),
-        d_input.unsafe_ptr(),
-        total_padded_32,
-        size,
-    )
-    result.structural = gpu_result[0].copy()
-    var char_types = gpu_result[1].copy()
-    var count = gpu_result[2]
-    result.pair_pos = List[Int32](capacity=count)
-    result.pair_pos.resize(count, -1)
-
-    if verbose:
-        var t2 = perf_counter_ns()
-        print("  Position extraction:", Float64(t2 - t1) / 1e6, "ms")
-        print("  Structural count:", len(result.structural))
-
-    # Match brackets on CPU using pre-computed char types
-    _match_brackets_fast(result, char_types)
-
-    if verbose:
-        var t4 = perf_counter_ns()
-        print("  Bracket matching:", Float64(t4 - t1) / 1e6, "ms")
-        print("  TOTAL GPU parse:", Float64(t4 - t0) / 1e6, "ms")
-
-    return result^
-
-
-def _parse_json_gpu_from_pinned_impl(
-    ctx: DeviceContext,
-    h_input: HostBuffer[DType.uint8],
-    size: Int,
-    total_padded_32: Int,
-    verbose: Bool,
-) raises -> JSONResult:
-    """GPU parsing from pre-loaded pinned memory - skips memcpy overhead."""
-    var result = JSONResult()
-    result.file_size = size
-
-    var num_blocks = ceildiv(total_padded_32, BLOCK_SIZE_OPT)
-    if num_blocks == 0:
-        num_blocks = 1
-
-    var t0 = perf_counter_ns()
-
-    # Direct H2D from pinned memory - no memcpy!
-    var d_input = ctx.enqueue_create_buffer[DType.uint8](size)
-    ctx.enqueue_copy(d_input, h_input)
-
-    if verbose:
-        ctx.synchronize()
-        var t_h2d = perf_counter_ns()
-        print("    H2D (from pinned):", Float64(t_h2d - t0) / 1e6, "ms")
-
-    # Allocate output buffers
-    var d_quote_bitmap = ctx.enqueue_create_buffer[DType.uint32](
-        total_padded_32
-    )
-    var d_popcounts = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
-    var d_quote_prefix = ctx.enqueue_create_buffer[DType.uint32](
-        total_padded_32
-    )
-    var d_structural = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
-    var d_open_close = ctx.enqueue_create_buffer[DType.uint32](total_padded_32)
-
-    # Phase 2: Build quote bitmap and compute popcounts
-    ctx.enqueue_function_unchecked[_quote_popcount_kernel](
-        d_input.unsafe_ptr(),
-        d_quote_bitmap.unsafe_ptr(),
-        d_popcounts.unsafe_ptr(),
-        UInt(size),
-        UInt(total_padded_32),
-        grid_dim=num_blocks,
-        block_dim=BLOCK_SIZE_OPT,
-    )
-
-    # Phase 3: Hierarchical prefix sums
-    var d_block_sums = ctx.enqueue_create_buffer[DType.uint32](num_blocks)
-
-    ctx.enqueue_function_unchecked[_block_prefix_kernel](
-        d_popcounts.unsafe_ptr(),
-        d_quote_prefix.unsafe_ptr(),
-        d_block_sums.unsafe_ptr(),
-        UInt(total_padded_32),
-        grid_dim=num_blocks,
-        block_dim=BLOCK_SIZE_OPT,
-    )
-
-    if num_blocks > 1:
-        var d_block_prefix = ctx.enqueue_create_buffer[DType.uint32](num_blocks)
-        var num_blocks_l1 = ceildiv(num_blocks, BLOCK_SIZE_OPT)
-
-        if num_blocks_l1 == 1:
-            var d_dummy = ctx.enqueue_create_buffer[DType.uint32](1)
-            ctx.enqueue_function_unchecked[_block_prefix_kernel](
-                d_block_sums.unsafe_ptr(),
-                d_block_prefix.unsafe_ptr(),
-                d_dummy.unsafe_ptr(),
-                UInt(num_blocks),
-                grid_dim=1,
-                block_dim=min(num_blocks, BLOCK_SIZE_OPT),
-            )
-        else:
-            var d_block_sums_l1 = ctx.enqueue_create_buffer[DType.uint32](
-                num_blocks_l1
-            )
-            ctx.enqueue_function_unchecked[_block_prefix_kernel](
-                d_block_sums.unsafe_ptr(),
-                d_block_prefix.unsafe_ptr(),
-                d_block_sums_l1.unsafe_ptr(),
-                UInt(num_blocks),
-                grid_dim=num_blocks_l1,
-                block_dim=BLOCK_SIZE_OPT,
-            )
-
-            var num_blocks_l2 = ceildiv(num_blocks_l1, BLOCK_SIZE_OPT)
-            var d_block_prefix_l1 = ctx.enqueue_create_buffer[DType.uint32](
-                num_blocks_l1
-            )
-            var d_dummy = ctx.enqueue_create_buffer[DType.uint32](1)
-
-            ctx.enqueue_function_unchecked[_block_prefix_kernel](
-                d_block_sums_l1.unsafe_ptr(),
-                d_block_prefix_l1.unsafe_ptr(),
-                d_dummy.unsafe_ptr(),
-                UInt(num_blocks_l1),
-                grid_dim=num_blocks_l2,
-                block_dim=min(num_blocks_l1, BLOCK_SIZE_OPT),
-            )
-
-            ctx.enqueue_function_unchecked[_add_block_offset_kernel](
-                d_block_prefix.unsafe_ptr(),
-                d_block_prefix_l1.unsafe_ptr(),
-                UInt(num_blocks),
-                grid_dim=num_blocks_l1,
-                block_dim=BLOCK_SIZE_OPT,
-            )
-
-        ctx.enqueue_function_unchecked[_add_block_offset_kernel](
-            d_quote_prefix.unsafe_ptr(),
-            d_block_prefix.unsafe_ptr(),
-            UInt(total_padded_32),
-            grid_dim=num_blocks,
-            block_dim=BLOCK_SIZE_OPT,
-        )
-
-    # Phase 4: Main fused kernel
-    ctx.enqueue_function_unchecked[fused_json_kernel](
-        d_input.unsafe_ptr(),
-        d_structural.unsafe_ptr(),
-        d_open_close.unsafe_ptr(),
-        d_quote_prefix.unsafe_ptr(),
-        UInt(size),
-        UInt(total_padded_32),
-        grid_dim=num_blocks,
-        block_dim=BLOCK_SIZE_OPT,
-    )
-
-    ctx.synchronize()
-    var t1 = perf_counter_ns()
-
-    if verbose:
-        print("  H2D + GPU kernels:", Float64(t1 - t0) / 1e6, "ms")
-
-    # Phase 5: Extract positions using GPU stream compaction
-    var char_types = List[UInt8]()
-    var gpu_result = extract_positions_gpu(
-        ctx,
-        d_structural.unsafe_ptr(),
-        d_input.unsafe_ptr(),
-        total_padded_32,
-        size,
-    )
-    result.structural = gpu_result[0].copy()
-    char_types = gpu_result[1].copy()
-    var count = gpu_result[2]
-    result.pair_pos = List[Int32](capacity=count)
-    result.pair_pos.resize(count, -1)
-
-    if verbose:
-        var t2 = perf_counter_ns()
-        print("  Position extraction:", Float64(t2 - t1) / 1e6, "ms")
-
-    # Match brackets on CPU
-    _match_brackets_fast(result, char_types)
-
-    if verbose:
-        var t4 = perf_counter_ns()
-        print("  Bracket matching:", Float64(t4 - t1) / 1e6, "ms")
-        print("  TOTAL GPU parse (from pinned):", Float64(t4 - t0) / 1e6, "ms")
-
-    return result^
-
-
-# ===== GPU Kernels =====
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(Int(BLOCK_SIZE_OPT))
-    )
-)
-def _quote_popcount_kernel(
-    input_data: UnsafePointer[UInt8, MutAnyOrigin],
-    output_quote: UnsafePointer[UInt32, MutAnyOrigin],
-    output_popcount: UnsafePointer[UInt32, MutAnyOrigin],
-    size: UInt,
-    total_padded_32: UInt,
-):
-    """Extract quote bitmap and compute popcount in one pass."""
-    var gid = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
-
-    if gid >= Int(total_padded_32):
-        return
-
-    var start_pos = gid * 32
-    var quote_bits: UInt32 = 0
-    var slash_bits: UInt32 = 0
-
-    # Unrolled 32-byte scan. Mirrors the unrolling already used in
-    # fused_json_kernel: letting the compiler unroll the 32-element loop
-    # dramatically improves instruction-level parallelism on NVIDIA/AMD
-    # (bit-masks become constant offsets, no loop counter, no branch).
-    # The branchless OR makes the trailing out-of-bounds iterations no-ops
-    # without needing a data-dependent break.
-    comptime for j in range(32):
-        var pos = start_pos + j
-        var in_bounds = UInt32(pos < Int(size))
-        var c = input_data[pos] if pos < Int(size) else UInt8(0)
-        var bit_mask = (UInt32(1) << UInt32(j)) * in_bounds
-
-        quote_bits |= bit_mask * UInt32(c == 0x22)  # "
-        slash_bits |= bit_mask * UInt32(c == 0x5C)  # \\
-
-    # Simple escape detection
-    var escaped = quote_bits & (slash_bits << 1)
-    var real_quotes = quote_bits & (~escaped)
-
-    output_quote[gid] = real_quotes
-    output_popcount[gid] = popcount_fast(real_quotes)
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(Int(BLOCK_SIZE_OPT))
-    )
-)
-def _block_prefix_kernel(
-    input_data: UnsafePointer[UInt32, MutAnyOrigin],
-    output_prefix: UnsafePointer[UInt32, MutAnyOrigin],
-    block_sums: UnsafePointer[UInt32, MutAnyOrigin],
-    total_size: UInt,
-):
-    """Compute block-local exclusive prefix sum and output block total."""
-    var tid = Int(thread_idx.x)
-    var bid = Int(block_idx.x)
-    var gid = bid * Int(block_dim.x) + tid
-
-    # Load value (0 if out of bounds)
-    var val: UInt32 = 0
-    if gid < Int(total_size):
-        val = input_data[gid]
-
-    # Compute block-local exclusive prefix sum using GPU primitive
-    var prefix = block.prefix_sum[exclusive=True, block_size=BLOCK_SIZE_OPT](
-        val
-    )
-
-    # Write prefix sum back
-    if gid < Int(total_size):
-        output_prefix[gid] = prefix
-
-    # Last thread in block writes block total
-    var block_end = min((bid + 1) * Int(block_dim.x), Int(total_size))
-    var last_in_block = block_end - 1 - bid * Int(block_dim.x)
-
-    if tid == last_in_block:
-        block_sums[bid] = prefix + val
-
-
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](
-        Int32(Int(BLOCK_SIZE_OPT))
-    )
-)
-def _add_block_offset_kernel(
-    data: UnsafePointer[UInt32, MutAnyOrigin],
-    block_offsets: UnsafePointer[UInt32, MutAnyOrigin],
-    total_size: UInt,
-):
-    """Add block offset to each element."""
-    var tid = Int(thread_idx.x)
-    var bid = Int(block_idx.x)
-    var gid = bid * Int(block_dim.x) + tid
-
-    if gid >= Int(total_size):
-        return
-
-    if bid > 0:
-        data[gid] = data[gid] + block_offsets[bid]
-
-
-# Char type constants (must match _gpu_stream_compact.mojo)
-comptime CHAR_TYPE_OPEN_BRACE: UInt8 = 1  # {
-comptime CHAR_TYPE_CLOSE_BRACE: UInt8 = 2  # }
-comptime CHAR_TYPE_OPEN_BRACKET: UInt8 = 3  # [
-comptime CHAR_TYPE_CLOSE_BRACKET: UInt8 = 4  # ]
-
-
-def _match_brackets_fast(mut result: JSONResult, char_types: List[UInt8]):
-    """Match brackets using pre-computed char types (no memory reads)."""
-    var stack = List[Int]()
-    var n = len(result.structural)
-
-    for i in range(n):
-        var ct = char_types[i]
-
-        # Open brackets: { or [
-        if ct == CHAR_TYPE_OPEN_BRACE or ct == CHAR_TYPE_OPEN_BRACKET:
-            stack.append(i)
-        # Close brackets: } or ]
-        elif ct == CHAR_TYPE_CLOSE_BRACE or ct == CHAR_TYPE_CLOSE_BRACKET:
-            if len(stack) > 0:
-                var open_idx = stack.pop()
-                result.pair_pos[open_idx] = Int32(i)
-                result.pair_pos[i] = Int32(open_idx)
